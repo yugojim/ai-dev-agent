@@ -23,11 +23,12 @@ from playwright_runner import (
     bootstrap_login_and_save_state,
 )
 
-from redmine_tool import (
+from scripts.redmine_tool import (
     get_first_low_priority_issue,
     write_issue_json,
     download_issue_attachments,
 )
+
 import subprocess
 
 MAX_ATTEMPTS = 3
