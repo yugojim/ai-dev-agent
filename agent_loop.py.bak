@@ -1,0 +1,627 @@
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import time
+from pathlib import Path
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
+
+from scripts.repo_tool import (
+    prepare_next_issue,
+    get_repo_dir,
+    get_task_context_dir,
+)
+from scripts.workspace import get_issue_workspace
+
+
+MAX_ATTEMPTS = 3
+APP_START_TIMEOUT = 120
+HEALTHCHECK_INTERVAL = 3
+
+
+def run_cmd(cmd, cwd=None, check=True, env=None):
+    print(f"$ {' '.join(cmd)}")
+    result = subprocess.run(
+        cmd,
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    if result.stdout:
+        print(result.stdout.strip())
+    if result.stderr:
+        print(result.stderr.strip())
+
+    if check and result.returncode != 0:
+        raise RuntimeError(result.stderr or f"Command failed: {' '.join(cmd)}")
+
+    return result
+
+
+def read_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def write_json(path: Path, data: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def extract_issue_no_from_prepare_output(text: str) -> str:
+    for line in text.splitlines():
+        if line.startswith("- issue: #"):
+            return line.split("#", 1)[1].strip()
+    raise RuntimeError("Failed to parse issue number from prepare output")
+
+
+def detect_project_type(repo_dir: Path) -> str:
+    if (repo_dir / "pom.xml").exists():
+        return "maven"
+    if (repo_dir / "gradlew").exists() or (repo_dir / "build.gradle").exists() or (repo_dir / "build.gradle.kts").exists():
+        return "gradle"
+    if (repo_dir / "package.json").exists():
+        return "node"
+    return "unknown"
+
+
+def build_initial_codex_prompt(issue_no: str) -> str:
+    return f"""
+Please read these files first:
+- ../task_context/issue.json
+- ../task_context/prompt.txt
+
+Also inspect files under:
+- ../attachments
+
+Task:
+Implement Redmine issue #{issue_no}.
+
+Rules:
+1. Keep changes minimal and limited to this ticket.
+2. Before editing, identify the relevant files and logic.
+3. Then edit the code to implement the requested behavior.
+4. Do not commit or push anything.
+5. After editing, summarize modified files and suggest exact startup/test commands.
+6. Do not start long-running local servers unless strictly necessary.
+7. Prefer build-safe changes that can later be verified with:
+   - mvn clean package
+   - mvn spring-boot:run
+""".strip()
+
+
+def build_retry_codex_prompt(issue_no: str, previous_result: dict, attempt: int) -> str:
+    return f"""
+The previous attempt for Redmine issue #{issue_no} did not pass validation.
+
+Attempt: {attempt}
+Playwright result: FAILED
+
+Failure summary:
+{previous_result.get("summary", "")}
+
+Expected:
+{previous_result.get("expected", "")}
+
+Actual:
+{previous_result.get("actual", "")}
+
+Artifacts:
+- Screenshot: {previous_result.get("screenshot", "")}
+- Console log: {previous_result.get("console_log", "")}
+
+Please revise the implementation.
+Keep changes limited to this ticket.
+Do not commit or push anything.
+After editing, summarize modified files and explain why the previous attempt failed.
+""".strip()
+
+
+def run_codex(repo_dir: Path, prompt: str) -> dict:
+    result = run_cmd(
+        ["codex", "-c", "model=gpt-5.4", "exec", prompt],
+        cwd=repo_dir,
+        check=False,
+    )
+    return {
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def run_build(repo_dir: Path) -> dict:
+    project_type = detect_project_type(repo_dir)
+
+    if project_type == "maven":
+        result = run_cmd(
+            ["mvn", "clean", "package"],
+            cwd=repo_dir,
+            check=False,
+        )
+        return {
+            "executed": True,
+            "project_type": project_type,
+            "command": "mvn clean package",
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "passed": result.returncode == 0,
+        }
+
+    if project_type == "gradle":
+        wrapper = "./gradlew" if (repo_dir / "gradlew").exists() else "gradle"
+        result = run_cmd(
+            [wrapper, "clean", "build"],
+            cwd=repo_dir,
+            check=False,
+        )
+        return {
+            "executed": True,
+            "project_type": project_type,
+            "command": f"{wrapper} clean build",
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "passed": result.returncode == 0,
+        }
+
+    if project_type == "node":
+        result = run_cmd(
+            ["npm", "run", "build"],
+            cwd=repo_dir,
+            check=False,
+        )
+        return {
+            "executed": True,
+            "project_type": project_type,
+            "command": "npm run build",
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "passed": result.returncode == 0,
+        }
+
+    return {
+        "executed": False,
+        "project_type": project_type,
+        "command": "",
+        "returncode": 1,
+        "stdout": "",
+        "stderr": "Unknown project type; cannot auto-build",
+        "passed": False,
+    }
+
+
+def start_app(repo_dir: Path, issue_no: str) -> dict:
+    project_type = detect_project_type(repo_dir)
+    logs_dir = get_issue_workspace(issue_no) / "runtime"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_file = logs_dir / "app.log"
+
+    if project_type == "maven":
+        cmd = f"nohup mvn spring-boot:run > {shlex.quote(str(log_file))} 2>&1 & echo $!"
+        proc = subprocess.run(
+            ["bash", "-lc", cmd],
+            cwd=repo_dir,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        pid = proc.stdout.strip().splitlines()[-1].strip()
+        return {"project_type": project_type, "pid": pid, "log_file": str(log_file), "command": "mvn spring-boot:run"}
+
+    if project_type == "gradle":
+        cmd = f"nohup ./gradlew bootRun > {shlex.quote(str(log_file))} 2>&1 & echo $!"
+        proc = subprocess.run(
+            ["bash", "-lc", cmd],
+            cwd=repo_dir,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        pid = proc.stdout.strip().splitlines()[-1].strip()
+        return {"project_type": project_type, "pid": pid, "log_file": str(log_file), "command": "./gradlew bootRun"}
+
+    if project_type == "node":
+        pkg = json.loads((repo_dir / "package.json").read_text(encoding="utf-8"))
+        scripts = pkg.get("scripts", {})
+        if "dev" in scripts:
+            run_script = "npm run dev"
+        elif "start" in scripts:
+            run_script = "npm start"
+        else:
+            raise RuntimeError("Node project has neither dev nor start script")
+
+        cmd = f"nohup {run_script} > {shlex.quote(str(log_file))} 2>&1 & echo $!"
+        proc = subprocess.run(
+            ["bash", "-lc", cmd],
+            cwd=repo_dir,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        pid = proc.stdout.strip().splitlines()[-1].strip()
+        return {"project_type": project_type, "pid": pid, "log_file": str(log_file), "command": run_script}
+
+    raise RuntimeError("Unknown project type; cannot auto-start app")
+
+
+def stop_app(pid: str | None):
+    if not pid:
+        return
+    subprocess.run(["bash", "-lc", f"kill {shlex.quote(pid)} >/dev/null 2>&1 || true"], text=True)
+
+
+def detect_port_from_log(log_file: Path) -> int | None:
+    if not log_file.exists():
+        return None
+
+    text = log_file.read_text(encoding="utf-8", errors="ignore")
+
+    patterns = [
+        r"Tomcat started on port\(s\): (\d+)",
+        r"Netty started on port (\d+)",
+        r"Local:\s+http://localhost:(\d+)",
+        r"localhost:(\d+)",
+        r"port[:= ]+(\d+)",
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+
+    return None
+
+
+def http_ok(url: str) -> bool:
+    try:
+        req = Request(url, headers={"User-Agent": "agent-loop"})
+        with urlopen(req, timeout=5) as resp:
+            return 200 <= resp.status < 400
+    except (URLError, HTTPError, TimeoutError):
+        return False
+
+
+def wait_for_app(runtime: dict) -> dict:
+    log_file = Path(runtime["log_file"])
+    started_at = time.time()
+    port = None
+
+    while time.time() - started_at < APP_START_TIMEOUT:
+        port = detect_port_from_log(log_file)
+        if port:
+            for path in ["/actuator/health", "/health", "/"]:
+                url = f"http://localhost:{port}{path}"
+                if http_ok(url):
+                    return {
+                        "ready": True,
+                        "port": port,
+                        "base_url": f"http://localhost:{port}",
+                        "health_url": url,
+                        "log_file": str(log_file),
+                    }
+        time.sleep(HEALTHCHECK_INTERVAL)
+
+    return {
+        "ready": False,
+        "port": port,
+        "base_url": f"http://localhost:{port}" if port else "",
+        "health_url": "",
+        "log_file": str(log_file),
+    }
+
+
+def run_playwright_test(issue_no: str, attempt: int, base_url: str) -> dict:
+    output_dir = get_issue_workspace(issue_no) / "test_results" / f"attempt_{attempt}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    result = run_cmd(
+        [
+            "python",
+            "-m",
+            "tests.playwright_runner",
+            base_url,
+            str(output_dir),
+        ],
+        cwd=Path.home() / "ai-dev-agent",
+        check=False,
+    )
+
+    result_json = output_dir / "result.json"
+    if result_json.exists():
+        return read_json(result_json)
+
+    return {
+        "passed": False,
+        "summary": "Playwright runner did not generate result.json",
+        "expected": "",
+        "actual": result.stderr or result.stdout or "Unknown failure",
+        "screenshot": str(output_dir / "screenshot.png"),
+        "console_log": str(output_dir / "console.log"),
+    }
+
+
+def write_report(issue_no: str, attempts: list[dict], mode: str) -> Path:
+    workspace_dir = get_issue_workspace(issue_no)
+    report_dir = workspace_dir / "report"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    final_passed = False
+    if attempts and attempts[-1].get("playwright"):
+        final_passed = attempts[-1]["playwright"].get("passed", False)
+
+    report = {
+        "issue_id": issue_no,
+        "mode": mode,
+        "attempt_count": len(attempts),
+        "final_passed": final_passed,
+        "manual_verification_commands": [
+            "mvn clean package",
+            "mvn spring-boot:run",
+        ],
+        "attempts": attempts,
+    }
+
+    json_path = report_dir / "agent_report.json"
+    write_json(json_path, report)
+
+    md_lines = [
+        f"# Agent Report - Issue #{issue_no}",
+        "",
+        f"Mode: {mode}",
+        f"Attempts: {len(attempts)}",
+        f"Final Passed: {report['final_passed']}",
+        "",
+        "## Manual Verification Commands",
+        "",
+        "```bash",
+        "mvn clean package",
+        "mvn spring-boot:run",
+        "```",
+        "",
+    ]
+
+    for item in attempts:
+        codex = item.get("codex", {})
+        build = item.get("build", {})
+        runtime = item.get("runtime", {})
+        playwright = item.get("playwright", {})
+
+        md_lines.extend([
+            f"## Attempt {item['attempt']}",
+            "",
+            f"- Codex return code: {codex.get('returncode')}",
+            f"- Build executed: {build.get('executed', False)}",
+            f"- Build passed: {build.get('passed', False)}",
+            f"- Build command: {build.get('command', '')}",
+            f"- Runtime ready: {runtime.get('ready', False)}",
+            f"- Base URL: {runtime.get('base_url', '')}",
+            f"- Health URL: {runtime.get('health_url', '')}",
+            f"- Playwright passed: {playwright.get('passed', False)}",
+            f"- Summary: {playwright.get('summary', '')}",
+            f"- Expected: {playwright.get('expected', '')}",
+            f"- Actual: {playwright.get('actual', '')}",
+            f"- Screenshot: {playwright.get('screenshot', '')}",
+            f"- Console log: {playwright.get('console_log', '')}",
+            f"- App log: {runtime.get('log_file', '')}",
+            "",
+        ])
+
+    if mode == "codex_only":
+        md_lines.extend([
+            "## Skipped Autonomous Phases",
+            "",
+            "- Build",
+            "- Application startup",
+            "- HTTP health check",
+            "- Playwright smoke test",
+            "- Retry convergence based on runtime validation",
+            "",
+        ])
+    elif mode == "build_only":
+        md_lines.extend([
+            "## Skipped Autonomous Phases",
+            "",
+            "- Application startup",
+            "- HTTP health check",
+            "- Playwright smoke test",
+            "",
+        ])
+
+    md_path = report_dir / "agent_report.md"
+    md_path.write_text("\n".join(md_lines), encoding="utf-8")
+    return md_path
+
+
+def ensure_codex_login():
+    result = run_cmd(["codex", "login", "--help"], check=False)
+    if result.returncode != 0:
+        raise RuntimeError("Codex CLI not available")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Autonomous dev agent loop")
+    parser.add_argument(
+        "--mode",
+        choices=["codex_only", "build_only", "full"],
+        default="codex_only",
+        help="Execution mode",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    mode = args.mode
+
+    ensure_codex_login()
+
+    prep = subprocess.run(
+        ["python", "-m", "scripts.repo_tool", "prepare-next-issue"],
+        cwd=Path.home() / "ai-dev-agent",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    if prep.stdout:
+        print(prep.stdout)
+    if prep.stderr:
+        print(prep.stderr)
+
+    if prep.returncode != 0:
+        raise RuntimeError("prepare-next-issue failed")
+
+    issue_no = extract_issue_no_from_prepare_output(prep.stdout)
+    repo_dir = get_repo_dir(issue_no)
+
+    attempts = []
+    prompt = build_initial_codex_prompt(issue_no)
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        print(f"\n=== ATTEMPT {attempt}/{MAX_ATTEMPTS} ===")
+
+        codex_result = run_codex(repo_dir, prompt)
+
+        build_result = {
+            "executed": False,
+            "passed": False,
+            "command": "",
+            "returncode": None,
+            "stdout": "",
+            "stderr": "",
+        }
+        runtime_result = {
+            "ready": False,
+            "port": None,
+            "base_url": "",
+            "health_url": "",
+            "log_file": "",
+        }
+        playwright_result = {
+            "passed": False,
+            "summary": "Not executed",
+            "expected": "",
+            "actual": "",
+            "screenshot": "",
+            "console_log": "",
+        }
+
+        if mode == "codex_only":
+            attempts.append({
+                "attempt": attempt,
+                "codex": codex_result,
+                "build": build_result,
+                "runtime": runtime_result,
+                "playwright": playwright_result,
+            })
+            report_path = write_report(issue_no, attempts, mode=mode)
+            print(f"Codex phase completed. Report written to: {report_path}")
+            return
+
+        build_result = run_build(repo_dir)
+
+        if not build_result.get("passed"):
+            attempts.append({
+                "attempt": attempt,
+                "codex": codex_result,
+                "build": build_result,
+                "runtime": runtime_result,
+                "playwright": {
+                    "passed": False,
+                    "summary": "Build failed",
+                    "expected": "Build should pass before runtime validation",
+                    "actual": build_result.get("stderr") or build_result.get("stdout", ""),
+                    "screenshot": "",
+                    "console_log": "",
+                },
+            })
+
+            if mode == "build_only":
+                report_path = write_report(issue_no, attempts, mode=mode)
+                print(f"Build failed. Report written to: {report_path}")
+                return
+
+            print("\nBuild FAILED.")
+            if attempt < MAX_ATTEMPTS:
+                prompt = build_retry_codex_prompt(
+                    issue_no,
+                    {
+                        "summary": "Build failed",
+                        "expected": "mvn clean package should pass",
+                        "actual": build_result.get("stderr") or build_result.get("stdout", ""),
+                        "screenshot": "",
+                        "console_log": "",
+                    },
+                    attempt,
+                )
+                continue
+
+            report_path = write_report(issue_no, attempts, mode=mode)
+            print(f"Max attempts reached. Report written to: {report_path}")
+            return
+
+        if mode == "build_only":
+            attempts.append({
+                "attempt": attempt,
+                "codex": codex_result,
+                "build": build_result,
+                "runtime": runtime_result,
+                "playwright": playwright_result,
+            })
+            report_path = write_report(issue_no, attempts, mode=mode)
+            print(f"Build phase completed. Report written to: {report_path}")
+            return
+
+        runtime = start_app(repo_dir, issue_no)
+        wait_result = wait_for_app(runtime)
+
+        if not wait_result["ready"]:
+            stop_app(runtime.get("pid"))
+            playwright_result = {
+                "passed": False,
+                "summary": "Application failed to become ready",
+                "expected": "Application should start and serve localhost",
+                "actual": f"Startup timeout. See log: {wait_result.get('log_file')}",
+                "screenshot": "",
+                "console_log": "",
+            }
+        else:
+            playwright_result = run_playwright_test(
+                issue_no=issue_no,
+                attempt=attempt,
+                base_url=wait_result["base_url"],
+            )
+            stop_app(runtime.get("pid"))
+
+        attempts.append({
+            "attempt": attempt,
+            "codex": codex_result,
+            "build": build_result,
+            "runtime": wait_result,
+            "playwright": playwright_result,
+        })
+
+        if playwright_result.get("passed"):
+            print("\nPlaywright PASSED.")
+            report_path = write_report(issue_no, attempts, mode=mode)
+            print(f"Report written to: {report_path}")
+            return
+
+        print("\nPlaywright FAILED.")
+        if attempt < MAX_ATTEMPTS:
+            prompt = build_retry_codex_prompt(issue_no, playwright_result, attempt)
+        else:
+            report_path = write_report(issue_no, attempts, mode=mode)
+            print(f"Max attempts reached. Report written to: {report_path}")
+            return
+
+
+if __name__ == "__main__":
+    main()

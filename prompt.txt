@@ -1,0 +1,185 @@
+# CONTEXT — Full Autonomous Dev Agent (WSL / Codex / Redmine / Playwright)
+
+You are helping to build and operate a Full Autonomous Dev Agent that performs automated ticket implementation.
+
+## Architecture Overview
+
+Environment:
+
+* Running inside WSL Ubuntu
+* Python virtualenv
+* Codex CLI (logged in via browser OAuth)
+* Git via SSH
+* Redmine REST API
+* Playwright headless browser testing
+
+Main workflow:
+
+1. Fetch next low priority Redmine issue
+2. Create isolated workspace
+3. Clone repo
+4. Create feature branch
+5. Run Codex to modify code
+6. Start application locally (Spring Boot / Node / Gradle auto-detected)
+7. Perform health check
+8. Run Playwright smoke test
+9. If failed → feedback to Codex → retry (max 3)
+10. Generate report only (no commit / no push)
+
+---
+
+## Workspace Layout
+
+~/ai-workspaces/issue-XXXX/
+
+attachments/
+repo/
+runtime/app.log
+task_context/
+issue.json
+prompt.txt
+test_results/attempt_n/
+report/agent_report.md
+
+---
+
+## Key Scripts
+
+### agent_loop.py
+
+Responsible for full autonomous loop:
+
+* run_codex()
+* start_app()
+* wait_for_app()
+* run_playwright_test()
+* retry logic
+* report generation
+
+### repo_tool.py
+
+Responsible for:
+
+* prepare-next-issue
+* branch creation
+* repo cloning
+* attachment download
+* workspace generation
+
+### playwright_runner.py
+
+Responsible for:
+
+* open localhost URL
+* detect error page / exception text
+* capture screenshot
+* output result.json
+
+---
+
+## Codex Execution Model
+
+Codex is executed via:
+
+codex --ask-for-approval never exec "<prompt>"
+
+Codex:
+
+* Reads repo
+* Edits files
+* Runs shell commands
+* Returns logs to agent
+
+No commit or push is allowed in current phase.
+
+---
+
+## Application Startup Strategy
+
+Spring Boot:
+
+nohup mvn spring-boot:run > runtime/app.log 2>&1 &
+
+Agent detects port by scanning log patterns:
+
+Tomcat started on port(s):
+Netty started on port
+localhost:
+
+Then performs HTTP health check:
+
+/actuator/health
+/health
+/
+
+---
+
+## Playwright Smoke Validation Logic
+
+Failure detection:
+
+* "whitelabel error page"
+* "exception"
+* navigation timeout
+
+Artifacts:
+
+* screenshot.png
+* console.log
+* result.json
+
+---
+
+## Retry Strategy
+
+Max attempts = 3
+
+On failure:
+
+* feedback summary injected into next Codex prompt
+* Codex revises implementation
+
+On final failure:
+
+* generate report
+* do not push
+* do not update Redmine status
+
+---
+
+## Current Status
+
+Agent loop is runnable.
+Codex login via OAuth is working.
+Repo cloning via SSH works.
+Workspace sandboxing works.
+Health check logic implemented.
+Playwright smoke test implemented.
+
+Remaining future upgrades (NOT implemented yet):
+
+* structured Playwright business flow tests
+* auto commit/push when pass
+* auto Redmine update
+* diff summarization
+* flaky test mitigation
+* multi-ticket queue scheduling
+
+---
+
+## Objective for next steps
+
+Stabilize:
+
+* Codex non-interactive execution reliability
+* startup detection robustness
+* Playwright deterministic validation
+* autonomous retry convergence
+* report readability
+
+---
+
+When answering future questions:
+Always assume this architecture exists.
+Do not redesign from scratch unless explicitly requested.
+Focus on improving autonomy, stability, and observability.

@@ -1,0 +1,362 @@
+nano bootstrap_agent.sh
+
+######
+#!/usr/bin/env bash
+
+set -e
+
+echo "======================================"
+echo " AI DEV AGENT BOOTSTRAP (WSL / Ubuntu)"
+echo "======================================"
+
+PROJECT_DIR=~/ai-dev-agent
+WORKSPACE_DIR=~/ai-workspaces
+
+echo
+echo "STEP 1 — install system deps"
+sudo apt update
+sudo apt install -y \
+    git curl unzip build-essential \
+    python3-full python3-venv python3-pip \
+    chromium-browser
+
+echo
+echo "STEP 2 — install Node LTS (via nvm)"
+
+if [ ! -d "$HOME/.nvm" ]; then
+  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+fi
+
+export NVM_DIR="$HOME/.nvm"
+source "$NVM_DIR/nvm.sh"
+
+nvm install 20
+nvm use 20
+nvm alias default 20
+
+echo
+echo "STEP 3 — install Codex CLI"
+npm install -g @openai/codex
+
+echo
+echo "STEP 4 — setup Python venv"
+
+cd $PROJECT_DIR
+
+rm -rf venv
+python3 -m venv venv
+source venv/bin/activate
+
+pip install --upgrade pip
+
+if [ -f requirements.txt ]; then
+  pip install -r requirements.txt
+else
+  pip install requests python-dotenv playwright
+fi
+
+playwright install chromium
+
+echo
+echo "STEP 5 — create workspace"
+mkdir -p $WORKSPACE_DIR
+
+echo
+echo "STEP 6 — setup SSH agent"
+
+eval "$(ssh-agent -s)"
+
+if [ -f ~/.ssh/id_ed25519 ]; then
+  ssh-add ~/.ssh/id_ed25519 || true
+fi
+
+echo
+echo "STEP 7 — diagnostics"
+
+echo "Node:"
+node -v
+
+echo "Codex:"
+codex --version
+
+echo "Python:"
+which python
+
+echo "Git:"
+git --version
+
+echo
+echo "======================================"
+echo " BOOTSTRAP COMPLETE"
+echo "======================================"
+######
+
+chmod +x bootstrap_agent.sh
+
+bash bootstrap_agent.sh
+
+source venv/bin/activate
+python -m scripts.redmine_tool
+python -m scripts.repo_tool prepare-next-issue
+cd ~/ai-workspaces/issue-6022/repo
+codex chat
+
+codex login
+
+nano run_agent.sh
+
+######
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+PROJECT_DIR="${HOME}/ai-dev-agent"
+VENV_DIR="${PROJECT_DIR}/venv"
+PYTHON_BIN="${VENV_DIR}/bin/python"
+
+AUTO_TEST=0
+AUTO_FINALIZE=0
+AUTO_CODEX=0
+ISSUE_NO=""
+CODEX_PROMPT=""
+
+usage() {
+  cat <<'EOF'
+Usage:
+  bash run_agent.sh [options]
+
+Options:
+  --issue <id>        Run a specific issue instead of prepare-next-issue
+  --auto-test         Run detected test/build command automatically
+  --finalize          Auto run finalize-issue after Codex/test step
+  --auto-codex        Run Codex non-interactively with generated prompt
+  --codex-prompt txt  Override Codex prompt text
+  -h, --help          Show help
+
+Examples:
+  bash run_agent.sh
+  bash run_agent.sh --issue 6022
+  bash run_agent.sh --issue 6022 --auto-test
+  bash run_agent.sh --issue 6022 --auto-codex --auto-test --finalize
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --issue)
+      ISSUE_NO="${2:-}"
+      shift 2
+      ;;
+    --auto-test)
+      AUTO_TEST=1
+      shift
+      ;;
+    --finalize)
+      AUTO_FINALIZE=1
+      shift
+      ;;
+    --auto-codex)
+      AUTO_CODEX=1
+      shift
+      ;;
+    --codex-prompt)
+      CODEX_PROMPT="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "[ERROR] Unknown argument: $1"
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+echo "======================================"
+echo " AI DEV AGENT RUNNER V2"
+echo "======================================"
+
+cd "$PROJECT_DIR"
+
+if [[ ! -d "$VENV_DIR" ]]; then
+  echo "[ERROR] venv not found: $VENV_DIR"
+  exit 1
+fi
+
+source "${VENV_DIR}/bin/activate"
+
+if ! command -v codex >/dev/null 2>&1; then
+  echo "[ERROR] codex CLI not found in PATH"
+  exit 1
+fi
+
+if [[ -n "$ISSUE_NO" ]]; then
+  echo
+  echo "[1/7] Prepare specified issue: #$ISSUE_NO"
+  PREP_OUTPUT="$($PYTHON_BIN -m scripts.repo_tool prepare-issue "$ISSUE_NO" 2>/dev/null || true)"
+  if [[ -z "$PREP_OUTPUT" ]]; then
+    echo "[INFO] prepare-issue command not available, using existing workspace assumptions."
+  fi
+else
+  echo
+  echo "[1/7] Prepare next Redmine issue..."
+  PREP_OUTPUT="$($PYTHON_BIN -m scripts.repo_tool prepare-next-issue)"
+fi
+
+if [[ -n "$PREP_OUTPUT" ]]; then
+  echo "$PREP_OUTPUT"
+fi
+
+if [[ -z "$ISSUE_NO" ]]; then
+  ISSUE_NO="$(echo "$PREP_OUTPUT" | sed -n 's/^- issue: #\([0-9]\+\)$/\1/p' | tail -n1)"
+fi
+
+if [[ -z "$ISSUE_NO" ]]; then
+  echo "[ERROR] Failed to determine issue number"
+  exit 1
+fi
+
+WORKSPACE_DIR="$($PYTHON_BIN - <<PY
+from scripts.workspace import get_issue_workspace
+print(get_issue_workspace(${ISSUE_NO}))
+PY
+)"
+
+REPO_DIR="${WORKSPACE_DIR}/repo"
+TASK_CONTEXT_DIR="${WORKSPACE_DIR}/task_context"
+PROMPT_FILE="${TASK_CONTEXT_DIR}/prompt.txt"
+ISSUE_JSON="${TASK_CONTEXT_DIR}/issue.json"
+ATTACHMENTS_DIR="${WORKSPACE_DIR}/attachments"
+
+BRANCH_NAME="$($PYTHON_BIN - <<PY
+from scripts.workspace import get_issue_branch
+print(get_issue_branch(${ISSUE_NO}))
+PY
+)"
+
+echo
+echo "[2/7] Parsed context"
+echo "ISSUE_NO     = ${ISSUE_NO}"
+echo "WORKSPACE    = ${WORKSPACE_DIR}"
+echo "REPO_DIR     = ${REPO_DIR}"
+echo "BRANCH_NAME  = ${BRANCH_NAME}"
+
+if [[ ! -d "${REPO_DIR}" ]]; then
+  echo "[ERROR] Repo dir not found: ${REPO_DIR}"
+  exit 1
+fi
+
+echo
+echo "[3/7] Context files"
+[[ -f "${PROMPT_FILE}" ]] && echo "- prompt: ${PROMPT_FILE}" || echo "- prompt: (missing)"
+[[ -f "${ISSUE_JSON}" ]] && echo "- issue json: ${ISSUE_JSON}" || echo "- issue json: (missing)"
+[[ -d "${ATTACHMENTS_DIR}" ]] && echo "- attachments dir: ${ATTACHMENTS_DIR}" || echo "- attachments dir: (missing)"
+
+cd "${REPO_DIR}"
+
+DEFAULT_CODEX_PROMPT="Please read ../task_context/issue.json and ../task_context/prompt.txt, inspect ../attachments if present, implement the requested change, keep changes limited to this ticket, then summarize modified files and suggested test commands."
+
+FINAL_CODEX_PROMPT="${CODEX_PROMPT:-$DEFAULT_CODEX_PROMPT}"
+
+echo
+echo "[4/7] Codex step"
+
+if [[ "$AUTO_CODEX" -eq 1 ]]; then
+  echo "[INFO] Running Codex in non-interactive mode"
+  if codex exec --help >/dev/null 2>&1; then
+    codex exec "$FINAL_CODEX_PROMPT"
+  else
+    echo "[WARN] 'codex exec' not available in this version. Falling back to interactive mode."
+    echo "Paste this prompt into Codex:"
+    echo
+    echo "$FINAL_CODEX_PROMPT"
+    echo
+    codex chat
+  fi
+else
+  echo "Recommended prompt:"
+  echo
+  echo "$FINAL_CODEX_PROMPT"
+  echo
+  codex chat
+fi
+
+echo
+echo "[5/7] Test step"
+
+run_detected_test() {
+  if [[ -f "pom.xml" ]]; then
+    echo "[INFO] Detected Maven project"
+    mvn -q -DskipTests compile
+    return 0
+  fi
+
+  if [[ -f "gradlew" ]]; then
+    echo "[INFO] Detected Gradle project"
+    chmod +x ./gradlew
+    ./gradlew test
+    return 0
+  fi
+
+  if [[ -f "package.json" ]]; then
+    echo "[INFO] Detected Node project"
+    if npm run | grep -q " test"; then
+      npm test
+    else
+      npm run build
+    fi
+    return 0
+  fi
+
+  echo "[INFO] No known test/build command detected"
+  return 0
+}
+
+if [[ "$AUTO_TEST" -eq 1 ]]; then
+  run_detected_test || true
+else
+  echo "Manual mode. Suggested checks:"
+  echo "  git diff"
+  echo "  git status"
+  if [[ -f "pom.xml" ]]; then
+    echo "  mvn -q -DskipTests compile"
+  elif [[ -f "package.json" ]]; then
+    echo "  npm test"
+  fi
+fi
+
+echo
+echo "[6/7] Git status"
+git status
+echo
+git branch --show-current || true
+
+if [[ -d "${ATTACHMENTS_DIR}" ]]; then
+  echo
+  echo "[Optional] Attachment list:"
+  find "${ATTACHMENTS_DIR}" -maxdepth 1 -type f | sed 's#^#- #' || true
+fi
+
+echo
+echo "[7/7] Finalize step"
+if [[ "$AUTO_FINALIZE" -eq 1 ]]; then
+  echo "[INFO] Auto finalize enabled"
+  "$PYTHON_BIN" -m scripts.repo_tool finalize-issue "${ISSUE_NO}"
+else
+  echo "Manual finalize command:"
+  echo "  python -m scripts.repo_tool finalize-issue ${ISSUE_NO}"
+fi
+
+echo
+echo "======================================"
+echo " RUN COMPLETE"
+echo "======================================"
+######
+
+chmod +x run_agent.sh
+bash run_agent.sh
+
+Please read ../task_context/issue.json and ../task_context/prompt.txt, inspect ../attachments if present, implement the requested change, then summarize modified files and suggested test commands.

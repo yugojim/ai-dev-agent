@@ -1,0 +1,14 @@
+certifi==2026.2.25
+charset-normalizer==3.4.6
+greenlet==3.3.2
+idna==3.11
+markdown-it-py==4.0.0
+mdurl==0.1.2
+playwright==1.51.0
+pyee==12.1.1
+Pygments==2.19.2
+python-dotenv==1.0.1
+requests==2.32.3
+rich==13.9.4
+typing_extensions==4.15.0
+urllib3==2.6.3
