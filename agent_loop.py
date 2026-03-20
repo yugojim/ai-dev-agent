@@ -23,6 +23,13 @@ from playwright_runner import (
     bootstrap_login_and_save_state,
 )
 
+from redmine_tool import (
+    get_first_low_priority_issue,
+    write_issue_json,
+    download_issue_attachments,
+)
+import subprocess
+
 MAX_ATTEMPTS = 3
 DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_CODEX_BIN = "codex"
@@ -77,7 +84,114 @@ class AttemptResult:
 
     def to_dict(self) -> dict:
         return asdict(self)
+def bootstrap_workspace(issue_id: str) -> Path:
 
+    workspace_dir = Path(f"~/ai-workspaces/issue-{issue_id}").expanduser().resolve()
+
+    repo_dir = workspace_dir / "repo"
+    task_context_dir = workspace_dir / "task_context"
+    attachments_dir = workspace_dir / "attachments"
+    report_dir = workspace_dir / "report"
+
+    if repo_dir.exists():
+        return workspace_dir
+
+    print(f"[agent] bootstrap workspace for issue {issue_id}")
+
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "git@github.com:panmed/ptms-neo-internal.git",
+            str(repo_dir),
+        ],
+        check=True,
+    )
+
+    task_context_dir.mkdir(exist_ok=True)
+    attachments_dir.mkdir(exist_ok=True)
+    report_dir.mkdir(exist_ok=True)
+
+    write_issue_json(issue_id, task_context_dir / "issue.json")
+    download_issue_attachments(issue_id, attachments_dir)
+
+    (task_context_dir / "prompt.txt").write_text(
+        f"Implement Redmine issue #{issue_id}",
+        encoding="utf-8",
+    )
+
+    return workspace_dir
+    
+def run_single_issue(issue_id: str, mode: str):
+
+    workspace_dir = bootstrap_workspace(issue_id)
+
+    print(f"[agent] running issue {issue_id}")
+
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        str(workspace_dir),
+        mode,
+    ]
+
+    subprocess.run(cmd)    
+    
+def ensure_workspace_from_redmine(workspace_dir: Path):
+    """
+    若 workspace 不存在 → 自動抓票 + 建立結構
+    """
+
+    repo_dir = workspace_dir / "repo"
+    task_dir = workspace_dir / "task_context"
+    attach_dir = workspace_dir / "attachments"
+    report_dir = workspace_dir / "report"
+
+    if repo_dir.exists():
+        return
+
+    print(f"[agent] workspace not found → bootstrap from Redmine")
+
+    from redmine_tool import (
+        get_issue_detail,
+        download_issue_attachments,
+        write_issue_json,
+    )
+    import subprocess
+
+    issue_id = workspace_dir.name.split("-")[-1]
+
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    # clone repo
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "git@github.com:panmed/ptms-neo-internal.git",
+            str(repo_dir),
+        ],
+        check=True,
+    )
+
+    task_dir.mkdir(exist_ok=True)
+    attach_dir.mkdir(exist_ok=True)
+    report_dir.mkdir(exist_ok=True)
+
+    # issue.json
+    write_issue_json(issue_id, task_dir / "issue.json")
+
+    # attachments
+    download_issue_attachments(issue_id, attach_dir)
+
+    # prompt placeholder
+    (task_dir / "prompt.txt").write_text(
+        f"Implement Redmine issue #{issue_id}",
+        encoding="utf-8",
+    )
+    
 def run_auth_phase(
     workspace_dir: Path,
     repo_dir: Path,
@@ -1448,4 +1562,29 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+
+    # ⭐ queue mode
+    if len(sys.argv) == 1:
+
+        print("[agent] autonomous queue runner started")
+
+        while True:
+
+            issue = get_first_low_priority_issue()
+
+            if not issue:
+                print("[agent] no ticket in queue, sleep 60s")
+                time.sleep(1200)
+                continue
+
+            issue_id = str(issue["id"])
+
+            try:
+                run_single_issue(issue_id, "full")
+            except Exception as e:
+                print(f"[agent] issue {issue_id} crashed: {e}")
+
+            time.sleep(5)
+
+    else:
+        raise SystemExit(main())
