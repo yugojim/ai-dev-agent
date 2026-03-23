@@ -1,48 +1,226 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 import json
 import os
 import re
-import signal
-import socket
+import shlex
+import shutil
 import subprocess
 import sys
 import time
 import traceback
-from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
-from codex_runner import CodexRunner
-from playwright_runner import (
-    probe_auth_with_state,
-    bootstrap_login_and_save_state,
+from dotenv import load_dotenv
+from scripts.redmine_tool import get_first_low_priority_issue
+
+load_dotenv()
+
+DEFAULT_WORKSPACE_ROOT = Path(
+    os.environ.get("WORKSPACE_BASE_DIR", str(Path.home() / "ai-workspaces"))
 )
 
-from scripts.redmine_tool import (
-    get_first_low_priority_issue,
-    write_issue_json,
-    download_issue_attachments,
-)
+DEFAULT_REPORT_STATUS_ID = os.environ.get("REDMINE_STATUS_ID_IN_PROGRESS", "2").strip()
+DEFAULT_REPORT_PRIORITY_ID = os.environ.get("REDMINE_PRIORITY_ID_NORMAL", "4").strip()
 
-import subprocess
+DEFAULT_REPO_SSH = os.environ.get("REPO_SSH_URL", "").strip()
+DEFAULT_REPO_HTTPS = os.environ.get("REPO_URL", "").strip()
+DEFAULT_AGENT_SOURCE_REPO = os.environ.get("AGENT_SOURCE_REPO", "").strip()
+DEFAULT_REPO_GIT_URL = (DEFAULT_REPO_SSH or DEFAULT_REPO_HTTPS).strip()
+APP_START_TIMEOUT = int(os.environ.get("APP_START_TIMEOUT", "600").strip())
+HEALTHCHECK_INTERVAL = int(os.environ.get("HEALTHCHECK_INTERVAL", "3").strip())
 
-MAX_ATTEMPTS = 3
-DEFAULT_MODEL = "gpt-5.4"
-DEFAULT_CODEX_BIN = "codex"
 
-BUILD_TIMEOUT_SECONDS = 600
-RUNTIME_START_TIMEOUT_SECONDS = 120
-RUNTIME_HEALTHCHECK_INTERVAL_SECONDS = 3
-DEFAULT_RUNTIME_PORT = 8080
-MAX_LOG_CHARS = 12000
-EARLY_LOG_ERROR_SCAN_CHARS = 20000
+def normalize_repo_git_url() -> str:
+    """
+    優先順序：
+    1. REPO_SSH_URL
+    2. REPO_URL
+    """
+    repo = DEFAULT_REPO_GIT_URL
 
-EXECUTION_ENFORCEMENT_BLOCK = """
+    if repo.startswith("https:/") and not repo.startswith("https://"):
+        print(f"[debug] 自動修正網址斜線: {repo}")
+        repo = repo.replace("https:/", "https://", 1)
+
+    return repo
+
+
+DEFAULT_REPO_GIT_URL = normalize_repo_git_url()
+
+AGENT_STEPS = [
+    "FETCH_ISSUE",
+    "PREPARE_WORKSPACE",
+    "PREPARE_TASK_CONTEXT",
+    "PREPARE_REPO",
+    "RUN_CODEX",
+    "RUN_BUILD",
+    "RUN_RUNTIME",
+    "WRITE_REPORT",
+    "UPDATE_REDMINE",
+    "DONE",
+]
+
+
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def set_step(report_data: dict, step: str, detail: str = ""):
+    report_data["current_step"] = step
+    report_data["current_step_detail"] = detail
+    report_data["updated_at"] = now_iso()
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print("=" * 80, flush=True)
+    print(f"[agent][{ts}] CURRENT STEP: {step}", flush=True)
+    if detail:
+        print(f"[agent][{ts}] DETAIL      : {detail}", flush=True)
+    print("=" * 80, flush=True)
+
+
+def write_json(path: str | Path, data: dict):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def tail_text(text: str, max_lines: int = 120) -> str:
+    if not text:
+        return ""
+    lines = text.splitlines()
+    return "\n".join(lines[-max_lines:])
+
+
+def tail_file(path: str | Path, max_lines: int = 120) -> str:
+    path = Path(path)
+    if not path.exists():
+        return ""
+    return tail_text(path.read_text(encoding="utf-8", errors="ignore"), max_lines=max_lines)
+
+
+def write_md(path: str | Path, report_data: dict):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = []
+    lines.append("# Agent Report")
+    lines.append("")
+    lines.append(f"- issue_id: {report_data.get('issue_id', '')}")
+    lines.append(f"- mode: {report_data.get('mode', '')}")
+    lines.append(f"- attempt_count: {report_data.get('attempt_count', '')}")
+    lines.append(f"- final_passed: {report_data.get('final_passed', '')}")
+    lines.append(f"- generated_at: {report_data.get('generated_at', '')}")
+    lines.append(f"- current_step: {report_data.get('current_step', '')}")
+    lines.append(f"- current_step_detail: {report_data.get('current_step_detail', '')}")
+    lines.append("")
+
+    attempts = report_data.get("attempts", [])
+    for i, attempt in enumerate(attempts, 1):
+        lines.append(f"## Attempt {i}")
+        lines.append("")
+
+        codex = attempt.get("codex", {})
+        build = attempt.get("build", {})
+        runtime = attempt.get("runtime", {})
+
+        lines.append("### Codex")
+        lines.append("")
+        lines.append(f"- executed: {codex.get('executed', '')}")
+        lines.append(f"- passed: {codex.get('passed', '')}")
+        lines.append(f"- returncode: {codex.get('returncode', '')}")
+        lines.append(f"- summary: {codex.get('summary', '')}")
+        modified_files = codex.get("modified_files", []) or []
+        if modified_files:
+            lines.append("")
+            lines.append("#### Modified Files")
+            lines.append("")
+            for f in modified_files:
+                lines.append(f"- `{f}`")
+        lines.append("")
+
+        lines.append("### Build")
+        lines.append("")
+        lines.append(f"- executed: {build.get('executed', '')}")
+        lines.append(f"- passed: {build.get('passed', '')}")
+        lines.append(f"- returncode: {build.get('returncode', '')}")
+        lines.append(f"- classification: {build.get('classification', '')}")
+        lines.append(f"- summary: {build.get('summary', '')}")
+        if build.get("log_tail"):
+            lines.append("")
+            lines.append("```text")
+            lines.append(build["log_tail"])
+            lines.append("```")
+        lines.append("")
+
+        lines.append("### Runtime")
+        lines.append("")
+        lines.append(f"- executed: {runtime.get('executed', '')}")
+        lines.append(f"- ready: {runtime.get('ready', '')}")
+        lines.append(f"- passed: {runtime.get('passed', '')}")
+        lines.append(f"- port: {runtime.get('port', '')}")
+        lines.append(f"- base_url: {runtime.get('base_url', '')}")
+        lines.append(f"- health_url: {runtime.get('health_url', '')}")
+        lines.append(f"- runtime_log: {runtime.get('runtime_log', '')}")
+        lines.append(f"- screenshot: {runtime.get('screenshot', '')}")
+        lines.append(f"- console_log: {runtime.get('console_log', '')}")
+        lines.append(f"- summary: {runtime.get('summary', '')}")
+        if runtime.get("log_tail"):
+            lines.append("")
+            lines.append("```text")
+            lines.append(runtime["log_tail"])
+            lines.append("```")
+        lines.append("")
+
+    redmine = report_data.get("redmine_post_update", {})
+    if redmine:
+        lines.append("## Redmine Post Update")
+        lines.append("")
+        lines.append(f"- executed: {redmine.get('executed', '')}")
+        lines.append(f"- passed: {redmine.get('passed', '')}")
+        lines.append(f"- returncode: {redmine.get('returncode', '')}")
+        lines.append(f"- error: {redmine.get('error', '')}")
+        lines.append("")
+
+    if report_data.get("error"):
+        lines.append("## Error")
+        lines.append("")
+        lines.append("```text")
+        lines.append(report_data["error"])
+        lines.append("```")
+        lines.append("")
+
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def build_prompt_from_issue(issue: dict) -> str:
+    subject = issue.get("subject", "")
+    raw = issue.get("raw", {})
+    description = raw.get("description", "")
+
+    return f"""Please read these files first:
+- task_context/issue.json
+- task_context/prompt.txt
+
+Task:
+Implement Redmine issue #{issue["issue_id"]}.
+
+Issue subject:
+{subject}
+
+Issue description:
+{description}
+
+Rules:
+1. Keep changes minimal and limited to this ticket.
+2. Before editing, identify relevant files and logic.
+3. Then apply the patch in the repo.
+4. Do not commit or push anything.
+5. After editing, summarize modified files and suggested verification commands.
+6. Do not start long-running servers unless necessary.
 
 CRITICAL EXECUTION RULES:
 
@@ -50,1542 +228,525 @@ You MUST apply the change by editing real files in the repository.
 Do not stop after analysis.
 Do not only describe the change.
 Do not propose pseudo-code.
-Do not explain what should be done.
-
 You must actually write and apply the patch.
-
 If no file is modified, the task will be considered FAILED.
-
-Ensure the patch is minimal and limited to the ticket scope.
-"""
+""".strip()
 
 
-@dataclass
-class PhaseResult:
-    executed: bool = False
-    passed: bool = False
-    command: str = ""
-    returncode: Optional[int] = None
-    stdout: str = ""
-    stderr: str = ""
-    error: str = ""
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class AttemptResult:
-    attempt: int
-    codex: Dict[str, Any]
-    build: Dict[str, Any]
-    auth: Dict[str, Any]
-    runtime: Dict[str, Any]
-    playwright: Dict[str, Any]
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-def bootstrap_workspace(issue_id: str) -> Path:
-
-    workspace_dir = Path(f"~/ai-workspaces/issue-{issue_id}").expanduser().resolve()
-
-    repo_dir = workspace_dir / "repo"
-    task_context_dir = workspace_dir / "task_context"
-    attachments_dir = workspace_dir / "attachments"
-    report_dir = workspace_dir / "report"
-
-    if repo_dir.exists():
-        return workspace_dir
-
-    print(f"[agent] bootstrap workspace for issue {issue_id}")
-
-    workspace_dir.mkdir(parents=True, exist_ok=True)
-
-    subprocess.run(
-        [
-            "git",
-            "clone",
-            "git@github.com:panmed/ptms-neo-internal.git",
-            str(repo_dir),
-        ],
-        check=True,
-    )
-
-    task_context_dir.mkdir(exist_ok=True)
-    attachments_dir.mkdir(exist_ok=True)
-    report_dir.mkdir(exist_ok=True)
-
-    write_issue_json(issue_id, task_context_dir / "issue.json")
-    download_issue_attachments(issue_id, attachments_dir)
-
-    (task_context_dir / "prompt.txt").write_text(
-        f"Implement Redmine issue #{issue_id}",
-        encoding="utf-8",
-    )
-
+def prepare_workspace(issue_id: str) -> Path:
+    workspace_dir = DEFAULT_WORKSPACE_ROOT / f"issue-{issue_id}"
+    (workspace_dir / "attachments").mkdir(parents=True, exist_ok=True)
+    (workspace_dir / "repo").mkdir(parents=True, exist_ok=True)
+    (workspace_dir / "runtime").mkdir(parents=True, exist_ok=True)
+    (workspace_dir / "task_context").mkdir(parents=True, exist_ok=True)
+    (workspace_dir / "report").mkdir(parents=True, exist_ok=True)
+    (workspace_dir / "report" / "runtime_logs").mkdir(parents=True, exist_ok=True)
+    (workspace_dir / "report" / "screenshots").mkdir(parents=True, exist_ok=True)
     return workspace_dir
-    
-def run_single_issue(issue_id: str, mode: str):
 
-    workspace_dir = bootstrap_workspace(issue_id)
 
-    print(f"[agent] running issue {issue_id}")
+def prepare_task_context(issue: dict, workspace_dir: Path):
+    issue_json_path = workspace_dir / "task_context" / "issue.json"
+    prompt_txt_path = workspace_dir / "task_context" / "prompt.txt"
 
-    cmd = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        str(workspace_dir),
-        mode,
-    ]
-
-    subprocess.run(cmd)    
-    
-def ensure_workspace_from_redmine(workspace_dir: Path):
-    """
-    若 workspace 不存在 → 自動抓票 + 建立結構
-    """
-
-    repo_dir = workspace_dir / "repo"
-    task_dir = workspace_dir / "task_context"
-    attach_dir = workspace_dir / "attachments"
-    report_dir = workspace_dir / "report"
-
-    if repo_dir.exists():
-        return
-
-    print(f"[agent] workspace not found → bootstrap from Redmine")
-
-    from redmine_tool import (
-        get_issue_detail,
-        download_issue_attachments,
-        write_issue_json,
-    )
-    import subprocess
-
-    issue_id = workspace_dir.name.split("-")[-1]
-
-    workspace_dir.mkdir(parents=True, exist_ok=True)
-
-    # clone repo
-    subprocess.run(
-        [
-            "git",
-            "clone",
-            "git@github.com:panmed/ptms-neo-internal.git",
-            str(repo_dir),
-        ],
-        check=True,
-    )
-
-    task_dir.mkdir(exist_ok=True)
-    attach_dir.mkdir(exist_ok=True)
-    report_dir.mkdir(exist_ok=True)
-
-    # issue.json
-    write_issue_json(issue_id, task_dir / "issue.json")
-
-    # attachments
-    download_issue_attachments(issue_id, attach_dir)
-
-    # prompt placeholder
-    (task_dir / "prompt.txt").write_text(
-        f"Implement Redmine issue #{issue_id}",
+    issue_json_path.write_text(
+        json.dumps(issue, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    
-def run_auth_phase(
-    workspace_dir: Path,
-    repo_dir: Path,
-    runtime_result: Dict[str, Any],
-) -> Dict[str, Any]:
+    prompt_txt_path.write_text(build_prompt_from_issue(issue), encoding="utf-8")
 
-    base_url = runtime_result.get("base_url", "http://localhost:8080")
-    auth_state_path = workspace_dir / "report" / "auth_state.json"
 
-    try:
-        ok = probe_auth_with_state(
-            base_url=base_url,
-            storage_state_path=str(auth_state_path),
-        )
+def prepare_repo(workspace_dir: Path) -> dict:
+    repo_dir = workspace_dir / "repo"
 
-        if ok:
-            return {
-                "executed": True,
-                "passed": True,
-                "classification": "",
-                "bootstrap_performed": False,
-                "state_path": str(auth_state_path),
-            }
-
-        bootstrap_login_and_save_state(
-            base_url=base_url,
-            storage_state_path=str(auth_state_path),
-        )
-
+    # 若 repo 已存在且非空，就直接使用
+    if repo_dir.exists() and any(repo_dir.iterdir()):
         return {
             "executed": True,
             "passed": True,
-            "classification": "",
-            "bootstrap_performed": True,
-            "state_path": str(auth_state_path),
+            "summary": "existing repo already present in workspace",
         }
 
-    except Exception as e:
-        return {
-            "executed": True,
-            "passed": False,
-            "classification": "auth_failed",
-            "error": str(e),
-            "bootstrap_performed": False,
-            "state_path": str(auth_state_path),
-        }
-        
-def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+    clone_url = DEFAULT_REPO_GIT_URL
 
+    # 優先用本地來源複製；若 AGENT_SOURCE_REPO 是遠端 repo，改走 git clone
+    if DEFAULT_AGENT_SOURCE_REPO:
+        source_repo = Path(DEFAULT_AGENT_SOURCE_REPO)
+        if source_repo.exists():
+            if repo_dir.exists():
+                shutil.rmtree(repo_dir)
+            shutil.copytree(source_repo, repo_dir)
+            return {
+                "executed": True,
+                "passed": True,
+                "summary": f"copied repo from {source_repo}",
+            }
 
-def write_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+        if "://" in DEFAULT_AGENT_SOURCE_REPO or DEFAULT_AGENT_SOURCE_REPO.startswith("git@"):
+            clone_url = DEFAULT_AGENT_SOURCE_REPO
+        else:
+            return {
+                "executed": True,
+                "passed": False,
+                "summary": f"AGENT_SOURCE_REPO not found: {source_repo}",
+            }
 
-
-def write_markdown(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-
-
-def now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
-
-
-def load_issue_json(issue_json_path: Path) -> dict:
-    return json.loads(read_text(issue_json_path))
-
-
-def trim_output(text: str, limit: int = MAX_LOG_CHARS) -> str:
-    if not text:
-        return ""
-    return text[-limit:]
-
-
-def normalize_path(path_text: str) -> str:
-    return path_text.replace("\\", "/").strip()
-
-
-def detect_modified_files(repo_dir: Path) -> List[str]:
-    try:
+    # 否則試著 git clone
+    if clone_url:
         proc = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=str(repo_dir),
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-        if proc.returncode != 0:
-            return []
-
-        files: List[str] = []
-        for line in proc.stdout.splitlines():
-            if not line.strip():
-                continue
-            file_part = line[3:].strip()
-            if file_part:
-                files.append(normalize_path(file_part))
-        return files
-    except Exception:
-        return []
-
-
-def extract_error_files(build_output: str) -> List[str]:
-    if not build_output:
-        return []
-
-    patterns = [
-        r"([A-Za-z0-9_./\\:-]+\.java)",
-        r"([A-Za-z0-9_./\\:-]+\.kt)",
-        r"([A-Za-z0-9_./\\:-]+\.groovy)",
-        r"([A-Za-z0-9_./\\:-]+\.properties)",
-        r"([A-Za-z0-9_./\\:-]+\.json)",
-        r"([A-Za-z0-9_./\\:-]+\.xml)",
-        r"([A-Za-z0-9_./\\:-]+\.yml)",
-        r"([A-Za-z0-9_./\\:-]+\.yaml)",
-    ]
-
-    found: List[str] = []
-    for pattern in patterns:
-        for match in re.findall(pattern, build_output):
-            cleaned = normalize_path(match)
-            if cleaned not in found:
-                found.append(cleaned)
-    return found
-
-
-def classify_build_failure(
-    returncode: Optional[int],
-    stdout: str,
-    stderr: str,
-    modified_files: List[str],
-    timed_out: bool = False,
-) -> str:
-    if timed_out:
-        return "build_timeout"
-
-    combined = f"{stdout}\n{stderr}"
-    combined_lower = combined.lower()
-
-    error_files = extract_error_files(combined)
-    normalized_modified = {normalize_path(f) for f in modified_files}
-    modified_basenames = {Path(f).name for f in normalized_modified}
-
-    matched_modified_file = False
-    for err_file in error_files:
-        normalized_err = normalize_path(err_file)
-        err_name = Path(normalized_err).name
-        if normalized_err in normalized_modified or err_name in modified_basenames:
-            matched_modified_file = True
-            break
-
-    has_compile_error = any(
-        key in combined_lower
-        for key in [
-            "compilation failure",
-            "compilation error",
-            "cannot find symbol",
-            "package does not exist",
-            "failed to execute goal",
-            "symbol:",
-            "location:",
-            "error:",
-        ]
-    )
-
-    if has_compile_error and not matched_modified_file:
-        return "pre_existing_compile_errors"
-
-    if returncode is None:
-        return "ticket_related_build_failure"
-
-    if returncode != 0:
-        return "ticket_related_build_failure"
-
-    if has_compile_error:
-        return "ticket_related_build_failure"
-
-    return ""
-
-
-def build_codex_prompt(
-    issue_json_path: Path,
-    prompt_txt_path: Path,
-    attachments_dir: Path,
-    retry_feedback: str = "",
-) -> str:
-    issue_obj = json.loads(issue_json_path.read_text(encoding="utf-8"))
-    issue_id = issue_obj.get("id", "UNKNOWN")
-
-    base = f"""Please read these files first:
-- {issue_json_path}
-- {prompt_txt_path}
-
-Also inspect files under:
-- {attachments_dir}
-
-Task:
-Implement Redmine issue #{issue_id}.
-
-Rules:
-1. Keep changes minimal and limited to this ticket.
-2. Before editing, identify the relevant files and logic.
-3. Then edit the code to implement the requested behavior.
-4. Do not commit or push anything.
-5. After editing, summarize modified files and suggest exact startup/test commands.
-6. Do not start long-running local servers unless strictly necessary.
-7. Prefer build-safe changes that can later be verified with:
-   - mvn package
-8. You MUST actually edit files in the repo when a code/resource change is required.
-9. If the workspace is not writable, state that clearly and stop immediately.
-"""
-
-    if retry_feedback.strip():
-        base += f"""
-
-Retry feedback from previous attempt:
-{retry_feedback}
-"""
-
-    base += EXECUTION_ENFORCEMENT_BLOCK
-    return base.strip()
-
-
-def run_build_phase(repo_dir: Path, modified_files: Optional[List[str]] = None) -> Dict[str, Any]:
-    modified_files = modified_files or []
-    cmd = ["mvn", "package"]
-
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(repo_dir),
+            ["git", "clone", clone_url, str(repo_dir)],
             capture_output=True,
             text=True,
             check=False,
-            timeout=BUILD_TIMEOUT_SECONDS,
         )
-
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
-        combined = f"{stdout}\n{stderr}".lower()
-
-        has_compile_error_text = any(
-            key in combined
-            for key in [
-                "cannot find symbol",
-                "compilation failure",
-                "compilation error",
-                "package does not exist",
-                "failed to execute goal",
-                "error:",
-            ]
-        )
-
-        passed = (proc.returncode == 0) and not has_compile_error_text
-
-        classification = ""
-        if not passed:
-            classification = classify_build_failure(
-                returncode=proc.returncode,
-                stdout=stdout,
-                stderr=stderr,
-                modified_files=modified_files,
-                timed_out=False,
-            )
-
         return {
             "executed": True,
-            "passed": passed,
-            "command": " ".join(cmd),
+            "passed": proc.returncode == 0,
             "returncode": proc.returncode,
-            "stdout": trim_output(stdout),
-            "stderr": trim_output(stderr),
-            "error": "",
-            "classification": classification,
-            "timeout_seconds": BUILD_TIMEOUT_SECONDS,
-            "error_files": extract_error_files(f"{stdout}\n{stderr}"),
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "summary": "git clone completed" if proc.returncode == 0 else "git clone failed",
         }
 
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
-
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode("utf-8", errors="replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode("utf-8", errors="replace")
-
-        return {
-            "executed": True,
-            "passed": False,
-            "command": " ".join(cmd),
-            "returncode": None,
-            "stdout": trim_output(stdout),
-            "stderr": trim_output(stderr),
-            "error": f"Build timed out after {BUILD_TIMEOUT_SECONDS} seconds",
-            "classification": "build_timeout",
-            "timeout_seconds": BUILD_TIMEOUT_SECONDS,
-            "error_files": extract_error_files(f"{stdout}\n{stderr}"),
-        }
-
-    except Exception as exc:
-        return {
-            "executed": True,
-            "passed": False,
-            "command": " ".join(cmd),
-            "returncode": None,
-            "stdout": "",
-            "stderr": "",
-            "error": f"{type(exc).__name__}: {exc}",
-            "classification": "ticket_related_build_failure",
-            "timeout_seconds": BUILD_TIMEOUT_SECONDS,
-            "error_files": [],
-        }
+    return {
+        "executed": True,
+        "passed": False,
+        "summary": "no repo source configured; set AGENT_SOURCE_REPO or AGENT_REPO_GIT_URL",
+    }
 
 
-def find_packaged_jar(repo_dir: Path) -> Optional[Path]:
-    target_dir = repo_dir / "target"
-    if not target_dir.exists():
+def detect_project_type(repo_dir: Path) -> str:
+    if (repo_dir / "pom.xml").exists():
+        return "maven"
+    if (repo_dir / "gradlew").exists() or (repo_dir / "build.gradle").exists() or (repo_dir / "build.gradle.kts").exists():
+        return "gradle"
+    if (repo_dir / "package.json").exists():
+        return "node"
+    return "unknown"
+
+
+def detect_port_from_log(log_file: Path) -> int | None:
+    if not log_file.exists():
         return None
 
-    jar_candidates = [
-        p for p in target_dir.glob("*.jar")
-        if p.is_file()
-        and not p.name.endswith(".original")
-        and not p.name.endswith("-sources.jar")
-        and not p.name.endswith("-javadoc.jar")
-        and "plain" not in p.name
+    text = log_file.read_text(encoding="utf-8", errors="ignore")
+    patterns = [
+        r"Tomcat started on port\(s\): (\d+)",
+        r"Netty started on port (\d+)",
+        r"Local:\s+http://localhost:(\d+)",
+        r"localhost:(\d+)",
+        r"port[:= ]+(\d+)",
     ]
 
-    if not jar_candidates:
-        return None
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
 
-    jar_candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return jar_candidates[0]
+    return None
 
 
-def is_port_open(host: str, port: int, timeout_seconds: float = 1.0) -> bool:
+def http_ok(url: str) -> bool:
     try:
-        with socket.create_connection((host, port), timeout=timeout_seconds):
-            return True
-    except OSError:
+        req = Request(url, headers={"User-Agent": "agent-loop"})
+        with urlopen(req, timeout=5) as resp:
+            return 200 <= resp.status < 400
+    except (URLError, HTTPError, TimeoutError):
         return False
 
 
-def detect_listening_pids(port: int) -> List[int]:
-    commands = [
-        ["bash", "-lc", f"ss -ltnp '( sport = :{port} )' || true"],
-        ["bash", "-lc", f"lsof -tiTCP:{port} -sTCP:LISTEN || true"],
-    ]
-
-    found: List[int] = []
-    pid_pattern = re.compile(r"pid=(\d+)")
-    plain_pid_pattern = re.compile(r"^\d+$")
-
-    for cmd in commands:
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            output = f"{proc.stdout}\n{proc.stderr}"
-            for pid_text in pid_pattern.findall(output):
-                pid = int(pid_text)
-                if pid not in found:
-                    found.append(pid)
-            for line in output.splitlines():
-                value = line.strip()
-                if plain_pid_pattern.fullmatch(value):
-                    pid = int(value)
-                    if pid not in found:
-                        found.append(pid)
-        except Exception:
-            continue
-
-    return found
+def copy_runtime_log_to_report(workspace_dir: Path, log_file: Path) -> str:
+    report_log = workspace_dir / "report" / "runtime_logs" / log_file.name
+    if log_file.exists():
+        shutil.copy2(log_file, report_log)
+    return str(report_log)
 
 
-def http_probe(host: str, port: int, path: str, timeout_seconds: float = 3.0) -> Tuple[bool, str]:
-    try:
-        import urllib.request
+def start_app(workspace_dir: Path) -> dict:
+    repo_dir = workspace_dir / "repo"
+    project_type = detect_project_type(repo_dir)
+    log_file = workspace_dir / "runtime" / "app.log"
 
-        url = f"http://{host}:{port}{path}"
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "agent-loop-runtime-probe"},
-        )
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
-            status = getattr(resp, "status", None) or resp.getcode()
-            body = resp.read(1000).decode("utf-8", errors="replace")
-            return 200 <= status < 500, f"{status} {body[:200]}"
-    except Exception as exc:
-        return False, f"{type(exc).__name__}: {exc}"
-
-
-def read_log_tail(log_path: Path, limit: int = MAX_LOG_CHARS) -> str:
-    if not log_path.exists():
-        return ""
-    try:
-        content = log_path.read_text(encoding="utf-8", errors="replace")
-        return trim_output(content, limit=limit)
-    except Exception:
-        return ""
-
-
-def read_log_head_and_tail(log_path: Path, limit: int = EARLY_LOG_ERROR_SCAN_CHARS) -> str:
-    if not log_path.exists():
-        return ""
-    try:
-        content = log_path.read_text(encoding="utf-8", errors="replace")
-        if len(content) <= limit:
-            return content
-        half = limit // 2
-        return content[:half] + "\n...\n" + content[-half:]
-    except Exception:
-        return ""
-
-
-def detect_runtime_failure_pattern(log_text: str) -> str:
-    lower = (log_text or "").lower()
-
-    patterns = [
-        ("runtime_port_conflict", [
-            "address already in use",
-            "port 8080 was already in use",
-            "failed to start component [connector",
-            "bindexception",
-        ]),
-        ("runtime_db_connection_failure", [
-            "failed to configure a datasource",
-            "jdbc",
-            "hikari",
-            "datasource",
-            "unable to acquire jdbc connection",
-        ]),
-        ("runtime_config_failure", [
-            "could not resolve placeholder",
-            "failed to bind properties",
-            "invalid config",
-            "configurationpropertiesbindexception",
-        ]),
-        ("runtime_classpath_failure", [
-            "classnotfoundexception",
-            "noclassdeffounderror",
-            "nosuchmethoderror",
-            "beancreationexception",
-        ]),
-        ("runtime_web_start_failure", [
-            "application run failed",
-            "web server failed to start",
-            "unable to start web server",
-            "failed to start bean",
-        ]),
-    ]
-
-    for classification, keywords in patterns:
-        if any(keyword in lower for keyword in keywords):
-            return classification
-
-    return ""
-
-
-def terminate_process_tree(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except Exception:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            return
-        time.sleep(0.5)
-
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-
-
-def classify_runtime_failure(
-    *,
-    timed_out: bool,
-    process_returncode: Optional[int],
-    port_open: bool,
-    probe_hits: List[Dict[str, str]],
-    log_text: str,
-    preexisting_port_conflict: bool,
-) -> str:
-    if preexisting_port_conflict:
-        return "runtime_port_conflict"
-
-    pattern_class = detect_runtime_failure_pattern(log_text)
-    if pattern_class:
-        return pattern_class
-
-    if timed_out:
-        if port_open and probe_hits:
-            return "runtime_healthcheck_not_ready"
-        if port_open:
-            return "runtime_port_open_but_unhealthy"
-        return "runtime_start_timeout"
-
-    if process_returncode is not None and process_returncode != 0:
-        return "runtime_process_exited"
-
-    if port_open:
-        return "runtime_healthcheck_not_ready"
-
-    return "runtime_not_reachable"
-
-
-def run_runtime_phase(
-    repo_dir: Path,
-    workspace_dir: Path,
-    build_soft_failed: bool = False,
-) -> Dict[str, Any]:
-    jar_path = find_packaged_jar(repo_dir)
-    logs_dir = workspace_dir / "report" / "runtime_logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    log_file = logs_dir / f"runtime_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-
-    base_url = f"http://127.0.0.1:{DEFAULT_RUNTIME_PORT}"
-    health_url = f"{base_url}/actuator/health"
-
-    if jar_path is None:
+    if project_type == "maven":
+        command = "mvn spring-boot:run"
+    elif project_type == "gradle":
+        command = "./gradlew bootRun" if (repo_dir / "gradlew").exists() else "gradle bootRun"
+    elif project_type == "node":
+        package_json = json.loads((repo_dir / "package.json").read_text(encoding="utf-8"))
+        scripts = package_json.get("scripts", {})
+        if "dev" in scripts:
+            command = "npm run dev"
+        elif "start" in scripts:
+            command = "npm start"
+        else:
+            return {
+                "executed": False,
+                "passed": False,
+                "summary": "node project has neither dev nor start script",
+            }
+    else:
         return {
-            "executed": True,
-            "ready": False,
+            "executed": False,
             "passed": False,
-            "build_soft_failed": build_soft_failed,
-            "port": DEFAULT_RUNTIME_PORT,
-            "base_url": base_url,
-            "health_url": health_url,
-            "command": "",
-            "jar_path": "",
-            "log_file": str(log_file),
-            "timeout_seconds": RUNTIME_START_TIMEOUT_SECONDS,
-            "process_id": None,
-            "returncode": None,
-            "classification": "runtime_jar_not_found",
-            "probe_hits": [],
-            "preexisting_port_conflict": False,
-            "preexisting_listening_pids": [],
-            "stdout": "",
-            "stderr": "",
-            "error": "Packaged jar not found under target/",
+            "summary": f"unknown project type: {project_type}",
         }
 
-    preexisting_pids = detect_listening_pids(DEFAULT_RUNTIME_PORT)
-    preexisting_port_conflict = len(preexisting_pids) > 0 or is_port_open("127.0.0.1", DEFAULT_RUNTIME_PORT)
-
-    if preexisting_port_conflict:
-        return {
-            "executed": True,
-            "ready": False,
-            "passed": False,
-            "build_soft_failed": build_soft_failed,
-            "port": DEFAULT_RUNTIME_PORT,
-            "base_url": base_url,
-            "health_url": health_url,
-            "command": f"java -jar {jar_path}",
-            "jar_path": str(jar_path),
-            "log_file": str(log_file),
-            "timeout_seconds": RUNTIME_START_TIMEOUT_SECONDS,
-            "process_id": None,
-            "returncode": None,
-            "classification": "runtime_port_conflict",
-            "probe_hits": [],
-            "preexisting_port_conflict": True,
-            "preexisting_listening_pids": preexisting_pids,
-            "stdout": "",
-            "stderr": "",
-            "error": f"Port {DEFAULT_RUNTIME_PORT} is already in use before runtime start",
-        }
-
-    cmd = ["java", "-jar", str(jar_path)]
-    health_candidates = [
-        "/actuator/health",
-        "/login",
-        "/",
-    ]
-
-    log_handle = None
-    proc: Optional[subprocess.Popen] = None
-
-    try:
-        log_handle = open(log_file, "w", encoding="utf-8", buffering=1)
-
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(repo_dir),
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
-
-        deadline = time.time() + RUNTIME_START_TIMEOUT_SECONDS
-        probe_hits: List[Dict[str, str]] = []
-
-        while time.time() < deadline:
-            current_returncode = proc.poll()
-            log_handle.flush()
-            log_text = read_log_head_and_tail(log_file)
-
-            failure_pattern = detect_runtime_failure_pattern(log_text)
-            if failure_pattern:
-                terminate_process_tree(proc)
-                return {
-                    "executed": True,
-                    "ready": False,
-                    "passed": False,
-                    "build_soft_failed": build_soft_failed,
-                    "port": DEFAULT_RUNTIME_PORT,
-                    "base_url": base_url,
-                    "health_url": health_url,
-                    "command": " ".join(cmd),
-                    "jar_path": str(jar_path),
-                    "log_file": str(log_file),
-                    "timeout_seconds": RUNTIME_START_TIMEOUT_SECONDS,
-                    "process_id": proc.pid,
-                    "returncode": proc.poll(),
-                    "classification": failure_pattern,
-                    "probe_hits": probe_hits,
-                    "preexisting_port_conflict": False,
-                    "preexisting_listening_pids": [],
-                    "stdout": "",
-                    "stderr": read_log_tail(log_file),
-                    "error": f"Runtime failed early: {failure_pattern}",
-                }
-
-            if current_returncode is not None:
-                terminate_process_tree(proc)
-                return {
-                    "executed": True,
-                    "ready": False,
-                    "passed": False,
-                    "build_soft_failed": build_soft_failed,
-                    "port": DEFAULT_RUNTIME_PORT,
-                    "base_url": base_url,
-                    "health_url": health_url,
-                    "command": " ".join(cmd),
-                    "jar_path": str(jar_path),
-                    "log_file": str(log_file),
-                    "timeout_seconds": RUNTIME_START_TIMEOUT_SECONDS,
-                    "process_id": proc.pid,
-                    "returncode": current_returncode,
-                    "classification": classify_runtime_failure(
-                        timed_out=False,
-                        process_returncode=current_returncode,
-                        port_open=False,
-                        probe_hits=probe_hits,
-                        log_text=log_text,
-                        preexisting_port_conflict=False,
-                    ),
-                    "probe_hits": probe_hits,
-                    "preexisting_port_conflict": False,
-                    "preexisting_listening_pids": [],
-                    "stdout": "",
-                    "stderr": read_log_tail(log_file),
-                    "error": f"Runtime process exited before becoming ready (returncode={current_returncode})",
-                }
-
-            port_open = is_port_open("127.0.0.1", DEFAULT_RUNTIME_PORT)
-            if port_open:
-                for path in health_candidates:
-                    ok, detail = http_probe("127.0.0.1", DEFAULT_RUNTIME_PORT, path)
-                    probe_hits.append(
-                        {
-                            "path": path,
-                            "ok": str(ok).lower(),
-                            "detail": detail,
-                        }
-                    )
-                    if ok:
-                        log_handle.flush()
-                        stdout_tail = read_log_tail(log_file)
-                        terminate_process_tree(proc)
-                        final_returncode = proc.poll()
-
-                        return {
-                            "executed": True,
-                            "ready": True,
-                            "passed": True,
-                            "build_soft_failed": build_soft_failed,
-                            "port": DEFAULT_RUNTIME_PORT,
-                            "base_url": base_url,
-                            "health_url": health_url,
-                            "command": " ".join(cmd),
-                            "jar_path": str(jar_path),
-                            "log_file": str(log_file),
-                            "timeout_seconds": RUNTIME_START_TIMEOUT_SECONDS,
-                            "process_id": proc.pid,
-                            "returncode": final_returncode,
-                            "classification": "",
-                            "probe_hits": probe_hits,
-                            "preexisting_port_conflict": False,
-                            "preexisting_listening_pids": [],
-                            "stdout": stdout_tail,
-                            "stderr": "",
-                            "error": "",
-                        }
-
-            time.sleep(RUNTIME_HEALTHCHECK_INTERVAL_SECONDS)
-
-        log_handle.flush()
-        log_text = read_log_head_and_tail(log_file)
-        stderr_tail = read_log_tail(log_file)
-        port_open = is_port_open("127.0.0.1", DEFAULT_RUNTIME_PORT)
-        terminate_process_tree(proc)
-
-        return {
-            "executed": True,
-            "ready": False,
-            "passed": False,
-            "build_soft_failed": build_soft_failed,
-            "port": DEFAULT_RUNTIME_PORT,
-            "base_url": base_url,
-            "health_url": health_url,
-            "command": " ".join(cmd),
-            "jar_path": str(jar_path),
-            "log_file": str(log_file),
-            "timeout_seconds": RUNTIME_START_TIMEOUT_SECONDS,
-            "process_id": proc.pid,
-            "returncode": proc.poll(),
-            "classification": classify_runtime_failure(
-                timed_out=True,
-                process_returncode=proc.poll(),
-                port_open=port_open,
-                probe_hits=probe_hits,
-                log_text=log_text,
-                preexisting_port_conflict=False,
-            ),
-            "probe_hits": probe_hits,
-            "preexisting_port_conflict": False,
-            "preexisting_listening_pids": [],
-            "stdout": "",
-            "stderr": stderr_tail,
-            "error": f"Runtime not ready after {RUNTIME_START_TIMEOUT_SECONDS} seconds",
-        }
-
-    except Exception as exc:
-        if proc is not None:
-            try:
-                terminate_process_tree(proc)
-            except Exception:
-                pass
-
-        return {
-            "executed": True,
-            "ready": False,
-            "passed": False,
-            "build_soft_failed": build_soft_failed,
-            "port": DEFAULT_RUNTIME_PORT,
-            "base_url": base_url,
-            "health_url": health_url,
-            "command": " ".join(cmd),
-            "jar_path": str(jar_path),
-            "log_file": str(log_file),
-            "timeout_seconds": RUNTIME_START_TIMEOUT_SECONDS,
-            "process_id": proc.pid if proc is not None else None,
-            "returncode": proc.poll() if proc is not None else None,
-            "classification": "runtime_exception",
-            "probe_hits": [],
-            "preexisting_port_conflict": False,
-            "preexisting_listening_pids": [],
-            "stdout": "",
-            "stderr": read_log_tail(log_file),
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-
-    finally:
-        if log_handle is not None:
-            try:
-                log_handle.close()
-            except Exception:
-                pass
-
-
-def make_empty_auth_result() -> dict:
+    shell_cmd = f"nohup {command} > {shlex.quote(str(log_file))} 2>&1 & echo $!"
+    proc = subprocess.run(
+        ["bash", "-lc", shell_cmd],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    pid = proc.stdout.strip().splitlines()[-1].strip() if proc.returncode == 0 and proc.stdout.strip() else ""
     return {
-        "authenticated": False,
-        "bootstrap_performed": False,
-        "state_file": str(Path.home() / "ai-dev-agent/.auth/cognito_auth_state.json"),
-        "final_url": "",
-        "error": "",
+        "executed": proc.returncode == 0,
+        "passed": proc.returncode == 0 and bool(pid),
+        "project_type": project_type,
+        "command": command,
+        "pid": pid,
+        "log_file": str(log_file),
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "summary": "app start command launched" if proc.returncode == 0 and pid else "failed to launch app",
     }
 
 
-def make_empty_runtime_result() -> dict:
+def stop_app(pid: str):
+    if not pid:
+        return
+    subprocess.run(
+        ["bash", "-lc", f"kill {shlex.quote(pid)} >/dev/null 2>&1 || true"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def wait_for_app(runtime: dict) -> dict:
+    log_file = Path(runtime["log_file"])
+    started_at = time.time()
+    port = None
+
+    while time.time() - started_at < APP_START_TIMEOUT:
+        port = detect_port_from_log(log_file)
+        if port:
+            for path in ("/actuator/health", "/health", "/"):
+                url = f"http://127.0.0.1:{port}{path}"
+                if http_ok(url):
+                    return {
+                        "ready": True,
+                        "passed": True,
+                        "port": port,
+                        "base_url": f"http://127.0.0.1:{port}",
+                        "health_url": url,
+                        "log_file": str(log_file),
+                        "summary": f"app ready on port {port}",
+                    }
+        time.sleep(HEALTHCHECK_INTERVAL)
+
     return {
-        "executed": False,
         "ready": False,
         "passed": False,
-        "build_soft_failed": False,
-        "port": None,
-        "base_url": "",
+        "port": port,
+        "base_url": f"http://127.0.0.1:{port}" if port else "",
         "health_url": "",
-        "command": "",
-        "jar_path": "",
-        "log_file": "",
-        "timeout_seconds": RUNTIME_START_TIMEOUT_SECONDS,
-        "process_id": None,
-        "returncode": None,
-        "classification": "",
-        "probe_hits": [],
-        "preexisting_port_conflict": False,
-        "preexisting_listening_pids": [],
-        "stdout": "",
-        "stderr": "",
-        "error": "",
+        "log_file": str(log_file),
+        "summary": "app did not become ready before timeout",
     }
 
 
-def make_empty_playwright_result() -> dict:
-    return {
-        "passed": False,
-        "summary": "Not executed",
-        "expected": "",
-        "actual": "",
-        "screenshot": "",
-        "console_log": "",
-    }
-
-
-def classify_codex_error(returncode: int, stdout: str, stderr: str, modified_files: List[str]) -> str:
-    combined = f"{stdout}\n{stderr}".lower()
-
-    if "unexpected argument '--approval-mode'" in combined:
-        return "UNSUPPORTED_APPROVAL_MODE"
-
-    if "unexpected argument '--sandbox'" in combined:
-        return "UNSUPPORTED_SANDBOX_OPTION"
-
-    if "unexpected argument 'exec'" in combined or "unrecognized subcommand 'exec'" in combined:
-        return "UNSUPPORTED_EXEC_SUBCOMMAND"
-
-    if "read-only filesystem" in combined or "sandbox: read-only" in combined:
-        return "READ_ONLY_SANDBOX"
-
-    if returncode != 0:
-        return "CODEX_NONZERO_EXIT"
-
-    if not modified_files:
-        return "NO_FILE_CHANGES"
-
-    return ""
-
-
-def build_retry_feedback(agent_error_class: str) -> str:
-    mapping = {
-        "UNSUPPORTED_APPROVAL_MODE": (
-            "Previous attempt failed because the Codex CLI does not support "
-            "--approval-mode. Remove that option."
-        ),
-        "UNSUPPORTED_SANDBOX_OPTION": (
-            "Previous attempt failed because the Codex CLI does not support "
-            "--sandbox. Use CLI-compatible invocation."
-        ),
-        "UNSUPPORTED_EXEC_SUBCOMMAND": (
-            "Previous attempt failed because this Codex CLI does not support "
-            "the exec subcommand. Use direct prompt invocation."
-        ),
-        "READ_ONLY_SANDBOX": (
-            "Previous attempt failed because Codex was in a read-only environment. "
-            "Use writable workspace mode."
-        ),
-        "NO_FILE_CHANGES": (
-            "Previous attempt produced no actual file edits. Apply the required "
-            "patch to the repository."
-        ),
-        "CODEX_NONZERO_EXIT": (
-            "Previous attempt failed during Codex execution. Re-check CLI invocation "
-            "and ensure the patch is actually applied."
-        ),
-    }
-    return mapping.get(
-        agent_error_class,
-        "Previous attempt did not pass. Re-check implementation and keep it minimal.",
-    )
-
-
-def should_break_early(agent_error_class: str) -> bool:
-    return agent_error_class in {
-        "UNSUPPORTED_APPROVAL_MODE",
-        "UNSUPPORTED_SANDBOX_OPTION",
-    }
-
-
-def run_codex_phase(
-    repo_dir: Path,
-    issue_json_path: Path,
-    prompt_txt_path: Path,
-    attachments_dir: Path,
-    retry_feedback: str = "",
-) -> Dict[str, Any]:
-    prompt = build_codex_prompt(
-        issue_json_path=issue_json_path,
-        prompt_txt_path=prompt_txt_path,
-        attachments_dir=attachments_dir,
-        retry_feedback=retry_feedback,
-    )
-
-    runner = CodexRunner(
-        codex_bin=DEFAULT_CODEX_BIN,
-        model=DEFAULT_MODEL,
-        reasoning_effort="medium",
-    )
-
-    result = runner.run(
-        prompt=prompt,
-        repo_dir=repo_dir,
-    )
-
-    codex_result = result.to_dict()
-    codex_result["shell_command"] = runner.shell(result.command)
-    codex_result["sandbox_mode"] = "workspace-write"
-    codex_result["writable_probe_passed"] = True
-    codex_result["writable_probe_error"] = ""
-    codex_result["agent_error_class"] = classify_codex_error(
-        returncode=result.returncode,
-        stdout=result.stdout,
-        stderr=result.stderr,
-        modified_files=result.modified_files,
-    )
-    return codex_result
-
-def run_playwright_phase(
-    workspace_dir: Path,
-    runtime_result: Dict[str, Any],
-    auth_result: Dict[str, Any],
-) -> Dict[str, Any]:
-
-    from playwright_runner import run_smoke_test
-
-    base_url = runtime_result.get("base_url")
-    state = auth_result.get("state_path")
-
-    try:
-        ok, screenshot = run_smoke_test(
-            base_url=base_url,
-            storage_state_path=state,
-            screenshot_dir=str(workspace_dir / "report"),
-        )
-
-        return {
-            "executed": True,
-            "passed": ok,
-            "classification": "" if ok else "smoke_failed",
-            "screenshot": screenshot,
-        }
-
-    except Exception as e:
-        return {
-            "executed": True,
-            "passed": False,
-            "classification": "playwright_exception",
-            "error": str(e),
-        }
-        
-def run_attempt(
-    attempt_no: int,
-    workspace_dir: Path,
-    repo_dir: Path,
-    issue_json_path: Path,
-    prompt_txt_path: Path,
-    attachments_dir: Path,
-    mode: str,
-    retry_feedback: str = "",
-) -> AttemptResult:
-
-    if mode == "build_only":
-        codex_result = {
-            "command": [],
-            "returncode": 0,
-            "stdout": "",
-            "stderr": "",
-            "sandbox_mode": "workspace-write",
-            "workspace": str(repo_dir),
-            "writable_probe_passed": True,
-            "writable_probe_error": "",
-            "invocation_style": "skipped_for_build_only",
-            "modified_files": detect_modified_files(repo_dir),
-            "shell_command": "",
-            "agent_error_class": "",
-        }
-    else:
-        codex_result = run_codex_phase(
-            repo_dir=repo_dir,
-            issue_json_path=issue_json_path,
-            prompt_txt_path=prompt_txt_path,
-            attachments_dir=attachments_dir,
-            retry_feedback=retry_feedback,
-        )
-
-    # -----------------
-    # Build phase
-    # -----------------
-    if mode in ("build_only", "full"):
-        build_result = run_build_phase(
-            repo_dir=repo_dir,
-            modified_files=codex_result.get("modified_files", []),
-        )
-    else:
-        build_result = PhaseResult(executed=False, passed=False).to_dict()
-
-    build_passed = build_result.get("passed", False)
-    build_class = build_result.get("classification", "")
-    build_soft_failed = (
-        not build_passed and build_class == "pre_existing_compile_errors"
-    )
-
-    allow_runtime = build_passed or build_soft_failed
-
-    # -----------------
-    # Runtime phase
-    # -----------------
-    if mode == "full" and allow_runtime:
-        runtime_result = run_runtime_phase(
-            repo_dir=repo_dir,
-            workspace_dir=workspace_dir,
-            build_soft_failed=build_soft_failed,
-        )
-    else:
-        runtime_result = make_empty_runtime_result()
-
-    # -----------------
-    # Auth phase
-    # -----------------
-    if mode == "full" and runtime_result.get("passed", False):
-        auth_result = run_auth_phase(
-            workspace_dir=workspace_dir,
-            repo_dir=repo_dir,
-            runtime_result=runtime_result,
-        )
-    else:
-        auth_result = make_empty_auth_result()
-
-    # -----------------
-    # Playwright phase
-    # -----------------
-    if mode == "full" and auth_result.get("passed", False):
-        playwright_result = run_playwright_phase(
-            workspace_dir=workspace_dir,
-            runtime_result=runtime_result,
-            auth_result=auth_result,
-        )
-    else:
-        playwright_result = make_empty_playwright_result()
-
-    return AttemptResult(
-        attempt=attempt_no,
-        codex=codex_result,
-        build=build_result,
-        auth=auth_result,
-        runtime=runtime_result,
-        playwright=playwright_result,
-    )
-
-
-def render_markdown_report(report: dict) -> str:
-    lines: List[str] = []
-
-    lines.append("# Agent Report")
-    lines.append("")
-    lines.append(f"- issue_id: {report.get('issue_id')}")
-    lines.append(f"- mode: {report.get('mode')}")
-    lines.append(f"- attempt_count: {report.get('attempt_count')}")
-    lines.append(f"- final_passed: {report.get('final_passed')}")
-    lines.append(f"- generated_at: {report.get('generated_at')}")
-    lines.append("")
-    lines.append("## Manual Verification Commands")
-    lines.append("")
-    for cmd in report.get("manual_verification_commands", []):
-        lines.append(f"- `{cmd}`")
-    lines.append("")
-
-    for attempt in report.get("attempts", []):
-        lines.append(f"## Attempt {attempt['attempt']}")
-        lines.append("")
-
-        codex = attempt["codex"]
-        build = attempt["build"]
-        runtime = attempt["runtime"]
-
-        lines.append("### Codex")
-        lines.append("")
-        lines.append(f"- returncode: {codex.get('returncode')}")
-        lines.append(f"- sandbox_mode: {codex.get('sandbox_mode')}")
-        lines.append(f"- invocation_style: {codex.get('invocation_style')}")
-        lines.append(f"- writable_probe_passed: {codex.get('writable_probe_passed')}")
-        lines.append(f"- agent_error_class: {codex.get('agent_error_class')}")
-        lines.append("")
-
-        lines.append("#### Modified Files")
-        lines.append("")
-        modified = codex.get("modified_files", [])
-        if modified:
-            for f in modified:
-                lines.append(f"- `{f}`")
-        else:
-            lines.append("- none")
-        lines.append("")
-
-        lines.append("#### Command")
-        lines.append("")
-        lines.append("```bash")
-        lines.append(codex.get("shell_command", ""))
-        lines.append("```")
-        lines.append("")
-
-        lines.append("#### Stdout")
-        lines.append("")
-        lines.append("```text")
-        lines.append(trim_output(codex.get("stdout", "")))
-        lines.append("```")
-        lines.append("")
-
-        lines.append("#### Stderr")
-        lines.append("")
-        lines.append("```text")
-        lines.append(trim_output(codex.get("stderr", "")))
-        lines.append("```")
-        lines.append("")
-
-        lines.append("### Build")
-        lines.append("")
-        lines.append(f"- executed: {build.get('executed')}")
-        lines.append(f"- passed: {build.get('passed')}")
-        lines.append(f"- returncode: {build.get('returncode')}")
-        lines.append(f"- classification: {build.get('classification', '')}")
-        lines.append(f"- timeout_seconds: {build.get('timeout_seconds', '')}")
-        lines.append(f"- error: {build.get('error', '')}")
-        lines.append("")
-
-        lines.append("#### Build Command")
-        lines.append("")
-        lines.append("```bash")
-        lines.append(build.get("command", ""))
-        lines.append("```")
-        lines.append("")
-
-        lines.append("#### Build Error Files")
-        lines.append("")
-        error_files = build.get("error_files", [])
-        if error_files:
-            for f in error_files:
-                lines.append(f"- `{f}`")
-        else:
-            lines.append("- none")
-        lines.append("")
-
-        lines.append("#### Build Stdout")
-        lines.append("")
-        lines.append("```text")
-        lines.append(trim_output(build.get("stdout", "")))
-        lines.append("```")
-        lines.append("")
-
-        lines.append("#### Build Stderr")
-        lines.append("")
-        lines.append("```text")
-        lines.append(trim_output(build.get("stderr", "")))
-        lines.append("```")
-        lines.append("")
-
-        lines.append("### Runtime")
-        lines.append("")
-        lines.append(f"- executed: {runtime.get('executed')}")
-        lines.append(f"- ready: {runtime.get('ready')}")
-        lines.append(f"- passed: {runtime.get('passed')}")
-        lines.append(f"- build_soft_failed: {runtime.get('build_soft_failed')}")
-        lines.append(f"- port: {runtime.get('port')}")
-        lines.append(f"- base_url: {runtime.get('base_url')}")
-        lines.append(f"- health_url: {runtime.get('health_url')}")
-        lines.append(f"- process_id: {runtime.get('process_id')}")
-        lines.append(f"- returncode: {runtime.get('returncode')}")
-        lines.append(f"- classification: {runtime.get('classification')}")
-        lines.append(f"- timeout_seconds: {runtime.get('timeout_seconds')}")
-        lines.append(f"- preexisting_port_conflict: {runtime.get('preexisting_port_conflict')}")
-        lines.append(f"- preexisting_listening_pids: {runtime.get('preexisting_listening_pids')}")
-        lines.append(f"- log_file: {runtime.get('log_file')}")
-        lines.append(f"- error: {runtime.get('error')}")
-        lines.append("")
-
-        lines.append("#### Runtime Command")
-        lines.append("")
-        lines.append("```bash")
-        lines.append(runtime.get("command", ""))
-        lines.append("```")
-        lines.append("")
-
-        lines.append("#### Runtime Probe Hits")
-        lines.append("")
-        probe_hits = runtime.get("probe_hits", [])
-        if probe_hits:
-            for hit in probe_hits:
-                lines.append(
-                    f"- `{hit.get('path')}` ok={hit.get('ok')} detail={hit.get('detail')}"
-                )
-        else:
-            lines.append("- none")
-        lines.append("")
-
-        lines.append("#### Runtime Stdout")
-        lines.append("")
-        lines.append("```text")
-        lines.append(trim_output(runtime.get("stdout", "")))
-        lines.append("```")
-        lines.append("")
-
-        lines.append("#### Runtime Stderr")
-        lines.append("")
-        lines.append("```text")
-        lines.append(trim_output(runtime.get("stderr", "")))
-        lines.append("```")
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-def main() -> int:
-    if len(sys.argv) < 2:
-        print("Usage: python agent_loop.py <workspace_dir> [mode]", file=sys.stderr)
-        return 2
-
-    workspace_dir = Path(sys.argv[1]).resolve()
-    mode = sys.argv[2] if len(sys.argv) >= 3 else "codex_only"
-
+def run_playwright_capture(workspace_dir: Path, base_url: str) -> dict:
     repo_dir = workspace_dir / "repo"
-    task_context_dir = workspace_dir / "task_context"
-    attachments_dir = workspace_dir / "attachments"
-    report_dir = workspace_dir / "report"
+    output_dir = workspace_dir / "report" / "screenshots"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    issue_json_path = task_context_dir / "issue.json"
-    prompt_txt_path = task_context_dir / "prompt.txt"
-    report_json_path = report_dir / "agent_report.json"
-    report_md_path = report_dir / "agent_report.md"
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("playwright_runner.py")), base_url, str(output_dir)],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
-    if not repo_dir.exists():
-        print(f"Repo dir not found: {repo_dir}", file=sys.stderr)
-        return 2
-    if not issue_json_path.exists():
-        print(f"issue.json not found: {issue_json_path}", file=sys.stderr)
-        return 2
-    if not prompt_txt_path.exists():
-        print(f"prompt.txt not found: {prompt_txt_path}", file=sys.stderr)
-        return 2
+    result_path = output_dir / "result.json"
+    if result_path.exists():
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result["executed"] = True
+        result["returncode"] = proc.returncode
+        result["stdout"] = proc.stdout
+        result["stderr"] = proc.stderr
+        return result
 
-    issue = load_issue_json(issue_json_path)
+    return {
+        "executed": True,
+        "passed": False,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "summary": "playwright runner did not generate result.json",
+        "actual": proc.stderr or proc.stdout,
+        "screenshot": str(output_dir / "screenshot.png"),
+        "console_log": str(output_dir / "console.log"),
+    }
 
-    attempts: List[dict] = []
-    final_passed = False
-    retry_feedback = ""
 
-    for i in range(1, MAX_ATTEMPTS + 1):
-        try:
-            attempt = run_attempt(
-                attempt_no=i,
-                workspace_dir=workspace_dir,
-                repo_dir=repo_dir,
-                issue_json_path=issue_json_path,
-                prompt_txt_path=prompt_txt_path,
-                attachments_dir=attachments_dir,
-                mode=mode,
-                retry_feedback=retry_feedback,
-            )
-            attempts.append(attempt.to_dict())
+def run_codex_phase_stub(workspace_dir: Path, issue: dict) -> dict:
+    """
+    先用 stub 跑通流程。
+    之後你把這段替換成真正的 codex_runner 呼叫即可。
+    """
+    prompt_path = workspace_dir / "task_context" / "prompt.txt"
+    return {
+        "executed": True,
+        "passed": True,
+        "returncode": 0,
+        "summary": f"stub codex phase; prompt prepared at {prompt_path}",
+        "modified_files": [],
+    }
 
-            codex_result = attempt.codex
-            build_result = attempt.build
-            runtime_result = attempt.runtime
 
-            agent_error_class = codex_result.get("agent_error_class", "")
-            modified_files = codex_result.get("modified_files", [])
-            returncode = codex_result.get("returncode", 1)
+def run_build_phase(workspace_dir: Path) -> dict:
+    repo_dir = workspace_dir / "repo"
+    project_type = detect_project_type(repo_dir)
 
-            if should_break_early(agent_error_class):
-                break
+    if project_type == "maven":
+        cmd = ["mvn", "clean", "package"]
+    elif project_type == "gradle":
+        cmd = ["./gradlew", "clean", "build"] if (repo_dir / "gradlew").exists() else ["gradle", "clean", "build"]
+    elif project_type == "node":
+        cmd = ["npm", "run", "build"]
+    else:
+        return {
+            "executed": False,
+            "passed": False,
+            "returncode": 1,
+            "classification": "unknown_project_type",
+            "summary": f"unknown project type: {project_type}",
+        }
 
-            codex_ok = (returncode == 0 and bool(modified_files)) if mode != "build_only" else True
-            build_ok = build_result.get("passed", False)
-            build_soft_failed = build_result.get("classification", "") == "pre_existing_compile_errors"
-            runtime_ok = runtime_result.get("passed", False)
+    proc = subprocess.run(
+        cmd,
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return {
+        "executed": True,
+        "passed": proc.returncode == 0,
+        "returncode": proc.returncode,
+        "classification": "",
+        "project_type": project_type,
+        "command": " ".join(cmd),
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "log_tail": tail_text(proc.stderr or proc.stdout),
+        "summary": "build phase passed" if proc.returncode == 0 else "build phase failed",
+    }
 
-            if mode == "codex_only":
-                if codex_ok:
-                    final_passed = True
-                    break
 
-            elif mode == "build_only":
-                if build_ok or build_soft_failed:
-                    final_passed = True
-                    break
+def run_runtime_phase(workspace_dir: Path) -> dict:
+    start_result = start_app(workspace_dir)
+    if not start_result.get("passed", False):
+        return {
+            "executed": start_result.get("executed", False),
+            "ready": False,
+            "passed": False,
+            "port": None,
+            "base_url": "",
+            "summary": start_result.get("summary", "failed to launch app"),
+            "stdout": start_result.get("stdout", ""),
+            "stderr": start_result.get("stderr", ""),
+            "log_tail": tail_text((start_result.get("stderr", "") or "") + "\n" + (start_result.get("stdout", "") or "")),
+        }
 
-            elif mode == "full":
-                if codex_ok and (build_ok or build_soft_failed) and runtime_ok:
-                    final_passed = True
-                    break
+    pid = start_result.get("pid", "")
+    try:
+        wait_result = wait_for_app(start_result)
+        runtime_log_report_path = copy_runtime_log_to_report(workspace_dir, Path(start_result["log_file"]))
 
-            else:
-                retry_feedback = f"Unknown mode: {mode}"
-                break
+        if not wait_result.get("ready", False):
+            wait_result["executed"] = True
+            wait_result["runtime_log"] = runtime_log_report_path
+            wait_result["project_type"] = start_result.get("project_type", "")
+            wait_result["command"] = start_result.get("command", "")
+            wait_result["log_tail"] = tail_file(runtime_log_report_path)
+            return wait_result
 
-            retry_feedback = build_retry_feedback(agent_error_class)
+        playwright_result = run_playwright_capture(workspace_dir, wait_result["base_url"])
+        return {
+            "executed": True,
+            "ready": wait_result.get("ready", False),
+            "passed": playwright_result.get("passed", False),
+            "port": wait_result.get("port"),
+            "base_url": wait_result.get("base_url", ""),
+            "health_url": wait_result.get("health_url", ""),
+            "runtime_log": runtime_log_report_path,
+            "project_type": start_result.get("project_type", ""),
+            "command": start_result.get("command", ""),
+            "screenshot": playwright_result.get("screenshot", ""),
+            "console_log": playwright_result.get("console_log", ""),
+            "expected": playwright_result.get("expected", ""),
+            "actual": playwright_result.get("actual", ""),
+            "stdout": playwright_result.get("stdout", ""),
+            "stderr": playwright_result.get("stderr", ""),
+            "log_tail": tail_file(runtime_log_report_path),
+            "summary": playwright_result.get("summary", wait_result.get("summary", "")),
+        }
+    finally:
+        stop_app(pid)
 
-        except Exception as exc:
-            attempts.append(
-                AttemptResult(
-                    attempt=i,
-                    codex={
-                        "command": [],
-                        "returncode": 1,
-                        "stdout": "",
-                        "stderr": f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}",
-                        "sandbox_mode": "workspace-write",
-                        "workspace": str(repo_dir),
-                        "writable_probe_passed": False,
-                        "writable_probe_error": str(exc),
-                        "invocation_style": "",
-                        "modified_files": [],
-                        "shell_command": "",
-                        "agent_error_class": "UNHANDLED_EXCEPTION",
-                    },
-                    build=PhaseResult(executed=False, passed=False).to_dict(),
-                    auth=make_empty_auth_result(),
-                    runtime=make_empty_runtime_result(),
-                    playwright=make_empty_playwright_result(),
-                ).to_dict()
-            )
-            break
 
-    report = {
-        "issue_id": str(issue.get("id", "")),
-        "mode": mode,
-        "attempt_count": len(attempts),
-        "final_passed": final_passed,
+def post_update_redmine(issue_id: str, workspace_dir: Path) -> dict:
+    project_root = Path(__file__).resolve().parent
+    cmd = [
+        sys.executable,
+        "-m",
+        "scripts.post_execution_redmine_update",
+        "--issue-id", str(issue_id),
+        "--workspace-dir", str(workspace_dir),
+        "--status-id", DEFAULT_REPORT_STATUS_ID,
+        "--priority-id", DEFAULT_REPORT_PRIORITY_ID,
+    ]
+
+    proc = subprocess.run(
+        cmd,
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    return {
+        "executed": True,
+        "passed": proc.returncode == 0,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "error": "" if proc.returncode == 0 else (proc.stderr or proc.stdout),
+    }
+
+
+def run_agent_for_issue(issue: dict):
+    issue_id = str(issue["issue_id"])
+    workspace_dir = prepare_workspace(issue_id)
+
+    report_json_path = workspace_dir / "report" / "agent_report.json"
+    report_md_path = workspace_dir / "report" / "agent_report.md"
+
+    report_data = {
+        "issue_id": issue_id,
+        "mode": "full",
+        "attempt_count": 1,
+        "final_passed": False,
+        "generated_at": now_iso(),
+        "current_step": "",
+        "current_step_detail": "",
+        "attempts": [],
+        "redmine_post_update": {},
         "manual_verification_commands": [
             "mvn package",
             "java -jar target/*.jar",
         ],
-        "generated_at": now_iso(),
-        "attempts": attempts,
     }
 
-    write_json(report_json_path, report)
-    write_markdown(report_md_path, render_markdown_report(report))
+    attempt = {
+        "codex": {},
+        "build": {},
+        "runtime": {},
+    }
 
-    print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0 if final_passed else 1
+    try:
+        set_step(report_data, "PREPARE_WORKSPACE", str(workspace_dir))
+        write_json(report_json_path, report_data)
+        write_md(report_md_path, report_data)
+
+        set_step(report_data, "PREPARE_TASK_CONTEXT", "write issue.json and prompt.txt")
+        prepare_task_context(issue, workspace_dir)
+        write_json(report_json_path, report_data)
+        write_md(report_md_path, report_data)
+
+        set_step(report_data, "PREPARE_REPO", "prepare repo into workspace/repo")
+        repo_result = prepare_repo(workspace_dir)
+        report_data["repo_prepare"] = repo_result
+        if not repo_result.get("passed", False):
+            raise RuntimeError(f"repo prepare failed: {repo_result.get('summary', '')}")
+        write_json(report_json_path, report_data)
+        write_md(report_md_path, report_data)
+
+        set_step(report_data, "RUN_CODEX", f"issue #{issue_id}")
+        attempt["codex"] = run_codex_phase_stub(workspace_dir, issue)
+        write_json(report_json_path, report_data)
+        write_md(report_md_path, report_data)
+
+        set_step(report_data, "RUN_BUILD", "stub build phase")
+        attempt["build"] = run_build_phase(workspace_dir)
+        write_json(report_json_path, report_data)
+        write_md(report_md_path, report_data)
+
+        set_step(report_data, "RUN_RUNTIME", "start app, wait for readiness, capture screenshot")
+        attempt["runtime"] = run_runtime_phase(workspace_dir)
+
+        report_data["attempts"] = [attempt]
+        report_data["final_passed"] = (
+            attempt["codex"].get("passed", False)
+            and attempt["build"].get("passed", False)
+            and attempt["runtime"].get("passed", False)
+        )
+
+        set_step(report_data, "WRITE_REPORT", "write final report")
+        write_json(report_json_path, report_data)
+        write_md(report_md_path, report_data)
+
+        set_step(
+            report_data,
+            "UPDATE_REDMINE",
+            "upload report and set status=In Progress, priority=Normal",
+        )
+        redmine_result = post_update_redmine(issue_id, workspace_dir)
+        report_data["redmine_post_update"] = redmine_result
+
+        write_json(report_json_path, report_data)
+        write_md(report_md_path, report_data)
+
+        set_step(report_data, "DONE", "completed")
+        write_json(report_json_path, report_data)
+        write_md(report_md_path, report_data)
+
+        print(f"[agent] completed issue #{issue_id}", flush=True)
+        return report_data
+
+    except Exception as e:
+        report_data["attempts"] = [attempt]
+        report_data["final_passed"] = False
+        report_data["error"] = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+        write_json(report_json_path, report_data)
+        write_md(report_md_path, report_data)
+        print(f"[agent] fatal error while processing issue #{issue_id}: {e}", flush=True)
+        raise
+
+
+def main():
+    print("[agent] autonomous queue runner started", flush=True)
+
+    print("[agent] fetching assigned low-priority issues...", flush=True)
+    issue = get_first_low_priority_issue()
+
+    if not issue:
+        print("[agent] no assigned low-priority issue found", flush=True)
+        return
+
+    print(f"[agent] picked issue #{issue['issue_id']} - {issue.get('subject', '')}", flush=True)
+    run_agent_for_issue(issue)
 
 
 if __name__ == "__main__":
-
-    # ⭐ queue mode
-    if len(sys.argv) == 1:
-
-        print("[agent] autonomous queue runner started")
-
-        while True:
-
-            issue = get_first_low_priority_issue()
-
-            if not issue:
-                print("[agent] no ticket in queue, sleep 60s")
-                time.sleep(1200)
-                continue
-
-            issue_id = str(issue["id"])
-
-            try:
-                run_single_issue(issue_id, "full")
-            except Exception as e:
-                print(f"[agent] issue {issue_id} crashed: {e}")
-
-            time.sleep(5)
-
-    else:
-        raise SystemExit(main())
+    try:
+        main()
+    except Exception as e:
+        print(f"[agent] fatal error: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        raise

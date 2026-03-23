@@ -1,362 +1,140 @@
-nano bootstrap_agent.sh
+✅ Step 0 — 進入 WSL / Ubuntu
+wsl
 
-######
-#!/usr/bin/env bash
+確認 Python：
 
-set -e
+python3 --version
 
-echo "======================================"
-echo " AI DEV AGENT BOOTSTRAP (WSL / Ubuntu)"
-echo "======================================"
+若沒有：
 
-PROJECT_DIR=~/ai-dev-agent
-WORKSPACE_DIR=~/ai-workspaces
-
-echo
-echo "STEP 1 — install system deps"
 sudo apt update
-sudo apt install -y \
-    git curl unzip build-essential \
-    python3-full python3-venv python3-pip \
-    chromium-browser
-
-echo
-echo "STEP 2 — install Node LTS (via nvm)"
-
-if [ ! -d "$HOME/.nvm" ]; then
-  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
-fi
-
-export NVM_DIR="$HOME/.nvm"
-source "$NVM_DIR/nvm.sh"
-
-nvm install 20
-nvm use 20
-nvm alias default 20
-
-echo
-echo "STEP 3 — install Codex CLI"
-npm install -g @openai/codex
-
-echo
-echo "STEP 4 — setup Python venv"
-
-cd $PROJECT_DIR
-
-rm -rf venv
+sudo apt install -y python3 python3-venv python3-pip git curl unzip
+✅ Step 1 — 建立 Agent Workspace
+mkdir -p ~/ai-dev-agent
+cd ~/ai-dev-agent
+✅ Step 2 — 建立 Python 虛擬環境
 python3 -m venv venv
+
+啟動：
+
 source venv/bin/activate
 
-pip install --upgrade pip
+看到：
 
-if [ -f requirements.txt ]; then
-  pip install -r requirements.txt
-else
-  pip install requests python-dotenv playwright
-fi
+(venv)
+
+代表成功。
+
+✅ Step 3 — 升級 pip
+pip install --upgrade pip wheel setuptools
+✅ Step 4 — 安裝 Agent 必備 Python 套件
+
+👉 這一組是 Full Agent Runtime 必備
+
+pip install \
+requests \
+python-dotenv \
+rich \
+tenacity \
+playwright \
+pydantic \
+gitpython \
+tqdm \
+pyyaml \
+✅ Step 5 — 安裝 Playwright Browser（非常重要）
+
+只 pip install 還不夠
+必須下載 browser runtime：
+
+playwright install
+
+如果你要 headless chrome 穩定：
 
 playwright install chromium
+✅ Step 6 — 安裝 Node（給某些 Cognito / UI flow）
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
 
-echo
-echo "STEP 5 — create workspace"
-mkdir -p $WORKSPACE_DIR
+確認：
 
-echo
-echo "STEP 6 — setup SSH agent"
-
-eval "$(ssh-agent -s)"
-
-if [ -f ~/.ssh/id_ed25519 ]; then
-  ssh-add ~/.ssh/id_ed25519 || true
-fi
-
-echo
-echo "STEP 7 — diagnostics"
-
-echo "Node:"
 node -v
+npm -v
+✅ Step 7 — 安裝 Codex CLI（核心）
+⭐ 建議方式（最穩）
+npm install -g @openai/codex
 
-echo "Codex:"
+確認：
+
 codex --version
+✅ Step 8 — 設定 OpenAI API Key
+nano ~/.bashrc
 
-echo "Python:"
-which python
+加入：
 
-echo "Git:"
-git --version
+export OPENAI_API_KEY="sk-xxxxx"
 
-echo
-echo "======================================"
-echo " BOOTSTRAP COMPLETE"
-echo "======================================"
-######
+套用：
 
-chmod +x bootstrap_agent.sh
+source ~/.bashrc
 
-bash bootstrap_agent.sh
+測試：
 
-source venv/bin/activate
-python -m scripts.redmine_tool
-python -m scripts.repo_tool prepare-next-issue
-cd ~/ai-workspaces/issue-6022/repo
-codex chat
+codex exec "say hello"
+✅ Step 9 — Git SSH（Agent 自動 clone 必備）
+ssh-keygen -t ed25519
+cat ~/.ssh/id_ed25519.pub
 
-codex login
+貼到 GitHub / GitLab。
 
-nano run_agent.sh
+測試：
 
-######
-#!/usr/bin/env bash
+ssh -T git@github.com
+✅ Step 10 — Agent 需要 Maven / Java
+sudo apt install -y openjdk-21-jdk maven
 
-set -euo pipefail
+確認：
 
-PROJECT_DIR="${HOME}/ai-dev-agent"
-VENV_DIR="${PROJECT_DIR}/venv"
-PYTHON_BIN="${VENV_DIR}/bin/python"
+java -version
+mvn -version
+✅ Step 11 — 測試 Spring Boot 可跑
+cd ~/ai-workspaces/issue-XXXX/repo
+mvn clean package -DskipTests --quiet
+mvn spring-boot:run
+✅ Step 12 — Agent 執行模式
+⭐ 只跑 Codex
 
-AUTO_TEST=0
-AUTO_FINALIZE=0
-AUTO_CODEX=0
-ISSUE_NO=""
-CODEX_PROMPT=""
+（現在最建議）
 
-usage() {
-  cat <<'EOF'
-Usage:
-  bash run_agent.sh [options]
+python agent_loop.py --mode codex_only
+⭐ Codex 完 → 手動驗證
+cd ~/ai-workspaces/issue-XXXX/repo
+mvn clean package
+mvn spring-boot:run
+⭐ 自動跑 Build Phase
+python agent_loop.py --mode build_only
+⭐ Full Autonomous
+python agent_loop.py --mode full
 
-Options:
-  --issue <id>        Run a specific issue instead of prepare-next-issue
-  --auto-test         Run detected test/build command automatically
-  --finalize          Auto run finalize-issue after Codex/test step
-  --auto-codex        Run Codex non-interactively with generated prompt
-  --codex-prompt txt  Override Codex prompt text
-  -h, --help          Show help
+流程：
 
-Examples:
-  bash run_agent.sh
-  bash run_agent.sh --issue 6022
-  bash run_agent.sh --issue 6022 --auto-test
-  bash run_agent.sh --issue 6022 --auto-codex --auto-test --finalize
-EOF
-}
+Codex → Build → Runtime → Auth → Playwright → Report
+✅ Step 13 — 網頁登入自動化（Cognito）
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --issue)
-      ISSUE_NO="${2:-}"
-      shift 2
-      ;;
-    --auto-test)
-      AUTO_TEST=1
-      shift
-      ;;
-    --finalize)
-      AUTO_FINALIZE=1
-      shift
-      ;;
-    --auto-codex)
-      AUTO_CODEX=1
-      shift
-      ;;
-    --codex-prompt)
-      CODEX_PROMPT="${2:-}"
-      shift 2
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "[ERROR] Unknown argument: $1"
-      usage
-      exit 1
-      ;;
-  esac
-done
+Agent 若要做：
 
-echo "======================================"
-echo " AI DEV AGENT RUNNER V2"
-echo "======================================"
+自動登入 → 保存 session → 跑 UI smoke test
 
-cd "$PROJECT_DIR"
+需要：
 
-if [[ ! -d "$VENV_DIR" ]]; then
-  echo "[ERROR] venv not found: $VENV_DIR"
-  exit 1
-fi
+Python side
 
-source "${VENV_DIR}/bin/activate"
+已裝：
 
-if ! command -v codex >/dev/null 2>&1; then
-  echo "[ERROR] codex CLI not found in PATH"
-  exit 1
-fi
-
-if [[ -n "$ISSUE_NO" ]]; then
-  echo
-  echo "[1/7] Prepare specified issue: #$ISSUE_NO"
-  PREP_OUTPUT="$($PYTHON_BIN -m scripts.repo_tool prepare-issue "$ISSUE_NO" 2>/dev/null || true)"
-  if [[ -z "$PREP_OUTPUT" ]]; then
-    echo "[INFO] prepare-issue command not available, using existing workspace assumptions."
-  fi
-else
-  echo
-  echo "[1/7] Prepare next Redmine issue..."
-  PREP_OUTPUT="$($PYTHON_BIN -m scripts.repo_tool prepare-next-issue)"
-fi
-
-if [[ -n "$PREP_OUTPUT" ]]; then
-  echo "$PREP_OUTPUT"
-fi
-
-if [[ -z "$ISSUE_NO" ]]; then
-  ISSUE_NO="$(echo "$PREP_OUTPUT" | sed -n 's/^- issue: #\([0-9]\+\)$/\1/p' | tail -n1)"
-fi
-
-if [[ -z "$ISSUE_NO" ]]; then
-  echo "[ERROR] Failed to determine issue number"
-  exit 1
-fi
-
-WORKSPACE_DIR="$($PYTHON_BIN - <<PY
-from scripts.workspace import get_issue_workspace
-print(get_issue_workspace(${ISSUE_NO}))
-PY
-)"
-
-REPO_DIR="${WORKSPACE_DIR}/repo"
-TASK_CONTEXT_DIR="${WORKSPACE_DIR}/task_context"
-PROMPT_FILE="${TASK_CONTEXT_DIR}/prompt.txt"
-ISSUE_JSON="${TASK_CONTEXT_DIR}/issue.json"
-ATTACHMENTS_DIR="${WORKSPACE_DIR}/attachments"
-
-BRANCH_NAME="$($PYTHON_BIN - <<PY
-from scripts.workspace import get_issue_branch
-print(get_issue_branch(${ISSUE_NO}))
-PY
-)"
-
-echo
-echo "[2/7] Parsed context"
-echo "ISSUE_NO     = ${ISSUE_NO}"
-echo "WORKSPACE    = ${WORKSPACE_DIR}"
-echo "REPO_DIR     = ${REPO_DIR}"
-echo "BRANCH_NAME  = ${BRANCH_NAME}"
-
-if [[ ! -d "${REPO_DIR}" ]]; then
-  echo "[ERROR] Repo dir not found: ${REPO_DIR}"
-  exit 1
-fi
-
-echo
-echo "[3/7] Context files"
-[[ -f "${PROMPT_FILE}" ]] && echo "- prompt: ${PROMPT_FILE}" || echo "- prompt: (missing)"
-[[ -f "${ISSUE_JSON}" ]] && echo "- issue json: ${ISSUE_JSON}" || echo "- issue json: (missing)"
-[[ -d "${ATTACHMENTS_DIR}" ]] && echo "- attachments dir: ${ATTACHMENTS_DIR}" || echo "- attachments dir: (missing)"
-
-cd "${REPO_DIR}"
-
-DEFAULT_CODEX_PROMPT="Please read ../task_context/issue.json and ../task_context/prompt.txt, inspect ../attachments if present, implement the requested change, keep changes limited to this ticket, then summarize modified files and suggested test commands."
-
-FINAL_CODEX_PROMPT="${CODEX_PROMPT:-$DEFAULT_CODEX_PROMPT}"
-
-echo
-echo "[4/7] Codex step"
-
-if [[ "$AUTO_CODEX" -eq 1 ]]; then
-  echo "[INFO] Running Codex in non-interactive mode"
-  if codex exec --help >/dev/null 2>&1; then
-    codex exec "$FINAL_CODEX_PROMPT"
-  else
-    echo "[WARN] 'codex exec' not available in this version. Falling back to interactive mode."
-    echo "Paste this prompt into Codex:"
-    echo
-    echo "$FINAL_CODEX_PROMPT"
-    echo
-    codex chat
-  fi
-else
-  echo "Recommended prompt:"
-  echo
-  echo "$FINAL_CODEX_PROMPT"
-  echo
-  codex chat
-fi
-
-echo
-echo "[5/7] Test step"
-
-run_detected_test() {
-  if [[ -f "pom.xml" ]]; then
-    echo "[INFO] Detected Maven project"
-    mvn -q -DskipTests compile
-    return 0
-  fi
-
-  if [[ -f "gradlew" ]]; then
-    echo "[INFO] Detected Gradle project"
-    chmod +x ./gradlew
-    ./gradlew test
-    return 0
-  fi
-
-  if [[ -f "package.json" ]]; then
-    echo "[INFO] Detected Node project"
-    if npm run | grep -q " test"; then
-      npm test
-    else
-      npm run build
-    fi
-    return 0
-  fi
-
-  echo "[INFO] No known test/build command detected"
-  return 0
-}
-
-if [[ "$AUTO_TEST" -eq 1 ]]; then
-  run_detected_test || true
-else
-  echo "Manual mode. Suggested checks:"
-  echo "  git diff"
-  echo "  git status"
-  if [[ -f "pom.xml" ]]; then
-    echo "  mvn -q -DskipTests compile"
-  elif [[ -f "package.json" ]]; then
-    echo "  npm test"
-  fi
-fi
-
-echo
-echo "[6/7] Git status"
-git status
-echo
-git branch --show-current || true
-
-if [[ -d "${ATTACHMENTS_DIR}" ]]; then
-  echo
-  echo "[Optional] Attachment list:"
-  find "${ATTACHMENTS_DIR}" -maxdepth 1 -type f | sed 's#^#- #' || true
-fi
-
-echo
-echo "[7/7] Finalize step"
-if [[ "$AUTO_FINALIZE" -eq 1 ]]; then
-  echo "[INFO] Auto finalize enabled"
-  "$PYTHON_BIN" -m scripts.repo_tool finalize-issue "${ISSUE_NO}"
-else
-  echo "Manual finalize command:"
-  echo "  python -m scripts.repo_tool finalize-issue ${ISSUE_NO}"
-fi
-
-echo
-echo "======================================"
-echo " RUN COMPLETE"
-echo "======================================"
-######
-
-chmod +x run_agent.sh
-bash run_agent.sh
-
-Please read ../task_context/issue.json and ../task_context/prompt.txt, inspect ../attachments if present, implement the requested change, then summarize modified files and suggested test commands.
+playwright
+requests
+Browser runtime
+playwright install
+Optional 更穩
+sudo apt install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 \
+libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2
