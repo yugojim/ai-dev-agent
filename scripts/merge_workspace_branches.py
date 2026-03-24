@@ -5,10 +5,9 @@ import shutil
 import subprocess
 from pathlib import Path
 
-DEFAULT_WORKSPACE_ROOT = os.environ.get(
-    "WORKSPACE_BASE_DIR",
-    str(Path.home() / "ai-workspaces"),
-)
+from scripts.config import resolve_workspace_base_dir
+
+DEFAULT_WORKSPACE_ROOT = resolve_workspace_base_dir(os.environ.get("WORKSPACE_BASE_DIR", ""))
 
 
 def get_issue_branch(issue_no: int | str) -> str:

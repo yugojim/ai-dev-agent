@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -15,14 +15,13 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
+from scripts.config import resolve_workspace_base_dir
 from scripts.redmine_tool import get_first_low_priority_issue
 from scripts.workspace import get_issue_branch
 
 load_dotenv()
 
-DEFAULT_WORKSPACE_ROOT = Path(
-    os.environ.get("WORKSPACE_BASE_DIR", str(Path.home() / "ai-workspaces"))
-)
+DEFAULT_WORKSPACE_ROOT = resolve_workspace_base_dir(os.environ.get("WORKSPACE_BASE_DIR", ""))
 
 DEFAULT_REPORT_STATUS_ID = os.environ.get("REDMINE_STATUS_ID_IN_PROGRESS", "2").strip()
 DEFAULT_REPORT_PRIORITY_ID = os.environ.get("REDMINE_PRIORITY_ID_NORMAL", "4").strip()
@@ -34,6 +33,19 @@ DEFAULT_REPO_GIT_URL = (DEFAULT_REPO_SSH or DEFAULT_REPO_HTTPS).strip()
 APP_START_TIMEOUT = int(os.environ.get("APP_START_TIMEOUT", "600").strip())
 HEALTHCHECK_INTERVAL = int(os.environ.get("HEALTHCHECK_INTERVAL", "3").strip())
 DEFAULT_APP_PORT = int(os.environ.get("APP_PORT", "8080").strip())
+
+
+def gradle_command(repo_dir: Path, *args: str) -> list[str]:
+    if os.name == "nt":
+        wrapper = repo_dir / "gradlew.bat"
+        if wrapper.exists():
+            return [str(wrapper), *args]
+    else:
+        wrapper = repo_dir / "gradlew"
+        if wrapper.exists():
+            return [str(wrapper), *args]
+
+    return ["gradle", *args]
 
 
 def normalize_repo_git_url() -> str:
@@ -361,7 +373,12 @@ def prepare_repo(workspace_dir: Path, issue_id: str) -> dict:
 def detect_project_type(repo_dir: Path) -> str:
     if (repo_dir / "pom.xml").exists():
         return "maven"
-    if (repo_dir / "gradlew").exists() or (repo_dir / "build.gradle").exists() or (repo_dir / "build.gradle.kts").exists():
+    if (
+        (repo_dir / "gradlew").exists()
+        or (repo_dir / "gradlew.bat").exists()
+        or (repo_dir / "build.gradle").exists()
+        or (repo_dir / "build.gradle.kts").exists()
+    ):
         return "gradle"
     if (repo_dir / "package.json").exists():
         return "node"
@@ -530,16 +547,16 @@ def start_app(workspace_dir: Path) -> dict:
     log_file = workspace_dir / "runtime" / "app.log"
 
     if project_type == "maven":
-        command = "mvn spring-boot:run"
+        cmd = ["mvn", "spring-boot:run"]
     elif project_type == "gradle":
-        command = "./gradlew bootRun" if (repo_dir / "gradlew").exists() else "gradle bootRun"
+        cmd = gradle_command(repo_dir, "bootRun")
     elif project_type == "node":
         package_json = json.loads((repo_dir / "package.json").read_text(encoding="utf-8"))
         scripts = package_json.get("scripts", {})
         if "dev" in scripts:
-            command = "npm run dev"
+            cmd = ["npm", "run", "dev"]
         elif "start" in scripts:
-            command = "npm start"
+            cmd = ["npm", "start"]
         else:
             return {
                 "executed": False,
@@ -553,38 +570,78 @@ def start_app(workspace_dir: Path) -> dict:
             "summary": f"unknown project type: {project_type}",
         }
 
-    shell_cmd = f"nohup {command} > {shlex.quote(str(log_file))} 2>&1 & echo $!"
-    proc = subprocess.run(
-        ["bash", "-lc", shell_cmd],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    pid = proc.stdout.strip().splitlines()[-1].strip() if proc.returncode == 0 and proc.stdout.strip() else ""
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    stdout_handle = log_file.open("w", encoding="utf-8")
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_dir,
+            stdout=stdout_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=(os.name != "nt"),
+            creationflags=creationflags,
+        )
+    except Exception as exc:
+        stdout_handle.close()
+        return {
+            "executed": True,
+            "passed": False,
+            "project_type": project_type,
+            "command": " ".join(cmd),
+            "pid": "",
+            "log_file": str(log_file),
+            "returncode": 1,
+            "stdout": "",
+            "stderr": str(exc),
+            "summary": "failed to launch app",
+        }
+    finally:
+        stdout_handle.close()
+
     return {
-        "executed": proc.returncode == 0,
-        "passed": proc.returncode == 0 and bool(pid),
+        "executed": True,
+        "passed": proc.poll() is None,
         "project_type": project_type,
-        "command": command,
-        "pid": pid,
+        "command": " ".join(cmd),
+        "pid": str(proc.pid),
         "log_file": str(log_file),
-        "returncode": proc.returncode,
-        "stdout": proc.stdout,
-        "stderr": proc.stderr,
-        "summary": "app start command launched" if proc.returncode == 0 and pid else "failed to launch app",
+        "returncode": 0 if proc.poll() is None else proc.returncode,
+        "stdout": "",
+        "stderr": "",
+        "summary": "app start command launched" if proc.poll() is None else "failed to launch app",
     }
 
 
 def stop_app(pid: str):
     if not pid:
         return
-    subprocess.run(
-        ["bash", "-lc", f"kill {shlex.quote(pid)} >/dev/null 2>&1 || true"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+
+    try:
+        pid_int = int(pid)
+    except ValueError:
+        return
+
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid_int), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return
+
+    try:
+        os.killpg(pid_int, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            os.kill(pid_int, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
 
 
 def wait_for_app(runtime: dict) -> dict:
@@ -686,7 +743,7 @@ def run_build_phase(workspace_dir: Path) -> dict:
     if project_type == "maven":
         cmd = ["mvn", "clean", "package"]
     elif project_type == "gradle":
-        cmd = ["./gradlew", "clean", "build"] if (repo_dir / "gradlew").exists() else ["gradle", "clean", "build"]
+        cmd = gradle_command(repo_dir, "clean", "build")
     elif project_type == "node":
         cmd = ["npm", "run", "build"]
     else:
