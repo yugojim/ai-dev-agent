@@ -46,6 +46,14 @@ pyyaml \
 只 pip install 還不夠
 必須下載 browser runtime：
 
+先補中文字型，避免截圖出現方塊字：
+
+sudo bash scripts/install_playwright_fonts.sh
+
+驗證：
+
+bash scripts/check_zh_fonts.sh
+
 playwright install
 
 如果你要 headless chrome 穩定：

@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -366,6 +367,23 @@ def validate_page(page, expected_texts: list[str], forbidden_texts: list[str]) -
     return True, "Page validation passed", final_url
 
 
+def detect_zh_font_support() -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(
+            ["fc-list", ":lang=zh", "family"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return False, "fontconfig not installed; cannot verify Chinese font support"
+
+    families = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if families:
+        return True, families[0]
+    return False, "no Chinese fonts detected; install fonts-noto-cjk for Playwright screenshots"
+
+
 def main():
     if len(sys.argv) < 3:
         raise SystemExit(
@@ -402,6 +420,7 @@ def main():
     }
 
     console_lines = []
+    font_ok, font_detail = detect_zh_font_support()
 
     try:
         with sync_playwright() as p:
@@ -419,6 +438,7 @@ def main():
                 storage_state_path=storage_state,
                 output_dir=output_dir,
             )
+            context.set_default_timeout(30000)
 
             page = context.new_page()
             page.on("console", lambda msg: console_lines.append(f"{msg.type}: {msg.text}"))
@@ -454,6 +474,9 @@ def main():
     except Exception as e:
         result["summary"] = "Playwright execution failed"
         result["actual"] = str(e)
+
+    result["font_check_passed"] = font_ok
+    result["font_check_detail"] = font_detail
 
     (output_dir / "result.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2),

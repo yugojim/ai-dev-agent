@@ -35,8 +35,15 @@ copy .env.example .env
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+bash scripts/install_playwright_fonts.sh
 playwright install
 cp .env.example .env
+```
+
+If Playwright screenshots show Chinese as tofu boxes, verify the runtime fonts:
+
+```bash
+bash scripts/check_zh_fonts.sh
 ```
 
 ## 3. Configure `.env`
@@ -99,4 +106,3 @@ codex edit "Fix issue #12345 based on the Redmine description and failing test o
 - Keep secrets only in `.env`.
 - Use a dedicated test account.
 - Review commands before running them.
-
