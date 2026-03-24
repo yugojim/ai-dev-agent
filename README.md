@@ -3,10 +3,10 @@
 A minimal local agent that:
 
 - reads Redmine issues via REST API
-- clones / updates a Git repo
-- asks you to use ChatGPT Web for reasoning
-- runs shell commands locally
-- runs Playwright smoke tests
+- prepares a per-issue workspace
+- clones or repairs a Git repo into that workspace
+- runs build and runtime checks locally
+- captures Playwright screenshots
 - writes results back to Redmine
 
 ## 1. Prerequisites
@@ -16,6 +16,7 @@ A minimal local agent that:
 - Git
 - Playwright browsers
 - Optional: Codex CLI
+- For Java projects: Maven or Gradle
 
 ## 2. Setup
 
@@ -26,7 +27,7 @@ python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 playwright install
-copy .env.example .env
+New-Item -Path .env -ItemType File
 ```
 
 ### macOS / Linux
@@ -35,12 +36,11 @@ copy .env.example .env
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-bash scripts/install_playwright_fonts.sh
 playwright install
-cp .env.example .env
+touch .env
 ```
 
-If Playwright screenshots show Chinese as tofu boxes, verify the runtime fonts:
+If Playwright screenshots show missing Chinese fonts on macOS/Linux, you can run:
 
 ```bash
 bash scripts/check_zh_fonts.sh
@@ -48,33 +48,83 @@ bash scripts/check_zh_fonts.sh
 
 ## 3. Configure `.env`
 
-Fill in your own secrets in `.env`.
-Never commit `.env`.
+Fill in your own secrets in `.env`. Never commit `.env`.
 
-## 4. Common commands
+Required variables:
 
-### Fetch one Redmine issue
-
-```bash
-python scripts/redmine_tool.py --next
+```env
+REDMINE_BASE_URL=https://your-redmine.example.com
+REDMINE_API_KEY=your_api_key
+REPO_URL=https://your.git/repo.git
+REPO_SSH_URL=git@your.git:repo.git
 ```
 
-### Clone or pull repo
+Useful optional variables:
 
-```bash
-python scripts/repo_tool.py sync
+```env
+WORKSPACE_BASE_DIR=~/ai-workspaces
+APP_PORT=8080
+APP_START_TIMEOUT=600
+HEALTHCHECK_INTERVAL=3
+PLAYWRIGHT_TEST_LOGIN_USERNAME=tester
+PLAYWRIGHT_TEST_LOGIN_CHINESE_NAME=測試使用者
+REDMINE_STATUS_ID_IN_PROGRESS=2
+REDMINE_PRIORITY_ID_NORMAL=4
+REDMINE_VERIFY_SSL=true
+REPO_DIR=
 ```
 
-### Create working branch
+Notes:
 
-```bash
-python scripts/repo_tool.py branch 12345-fix-login
+- `WORKSPACE_BASE_DIR` now uses a cross-platform path resolved by Python `pathlib`.
+- On Windows you can also set `WORKSPACE_BASE_DIR` to a native path such as `C:\ai-workspaces`.
+- If `WORKSPACE_BASE_DIR` is not set, the default is `<home>/ai-workspaces`.
+- `REPO_DIR` is only needed if you use `scripts/shell_runner.py`.
+
+## 4. Workspace layout
+
+Each issue gets its own workspace:
+
+```text
+<WORKSPACE_BASE_DIR>/
+  issue-12345/
+    attachments/
+    repo/
+    runtime/
+    task_context/
+    report/
 ```
 
-### Run smoke tests
+## 5. Common commands
+
+### Fetch the next assigned low-priority issue from Redmine
 
 ```bash
-python tests/playwright_smoke.py
+python scripts/redmine_tool.py
+```
+
+### Prepare the next issue workspace automatically
+
+```bash
+python scripts/repo_tool.py prepare-next-issue
+```
+
+### Prepare a specific issue workspace
+
+```bash
+python scripts/repo_tool.py prepare-issue 12345
+```
+
+### Check Git status for an issue workspace
+
+```bash
+python scripts/repo_tool.py status 12345
+```
+
+### Finalize and push an issue branch
+
+```bash
+python scripts/repo_tool.py finalize-issue 12345
 ```
 
 ### Run the guided local loop
@@ -83,24 +133,40 @@ python tests/playwright_smoke.py
 python agent_loop.py
 ```
 
-## 5. Suggested workflow
+## 6. What `agent_loop.py` does
 
-1. `python agent_loop.py`
-2. The tool fetches one Redmine issue.
-3. Paste the issue into ChatGPT Web and get a fix plan.
-4. Use Codex CLI or edit code manually.
-5. Run build/tests.
-6. Run Playwright smoke test.
-7. The script can post a Redmine note and optionally move the issue status.
+The loop currently performs this flow:
 
-## 6. Codex CLI examples
+1. Fetch one issue from Redmine.
+2. Create `issue-<id>` workspace folders.
+3. Write `task_context/issue.json` and `task_context/prompt.txt`.
+4. Clone the repository into `workspace/repo`.
+5. Create or switch to `feat/<issue_id>`.
+6. Run the current Codex phase stub.
+7. Run build validation.
+8. Start the app locally.
+9. Wait for health checks on `http://localhost:<APP_PORT>`.
+10. Run Playwright capture and save runtime artifacts.
+11. If checks pass, commit, rebase, and push.
+12. Upload the report back to Redmine.
+
+## 7. Cross-platform behavior
+
+The runtime flow is now designed for both macOS and Windows:
+
+- Workspace paths are built with `pathlib`, not hardcoded slash paths.
+- Gradle uses `gradlew.bat` on Windows and `gradlew` on macOS.
+- App start/stop uses Python `subprocess` handling instead of `bash`, `nohup`, or `kill`.
+- Default workspace resolution uses your current user's home directory on both platforms.
+
+## 8. Codex CLI examples
 
 ```bash
 codex --help
-codex edit "Fix issue #12345 based on the Redmine description and failing test output"
+codex exec -m gpt-5.4 -s workspace-write -C /path/to/repo "Fix the Redmine issue in task_context/prompt.txt"
 ```
 
-## 7. Security
+## 9. Security
 
 - Rotate any secret that was ever pasted into chat.
 - Keep secrets only in `.env`.
