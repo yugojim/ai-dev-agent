@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 import requests
@@ -9,7 +10,6 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
-
 
 REDMINE_BASE_URL = os.environ.get("REDMINE_BASE_URL", "").strip().rstrip("/")
 REDMINE_API_KEY = os.environ.get("REDMINE_API_KEY", "").strip()
@@ -47,9 +47,6 @@ def _request(method: str, path: str, *, params: dict[str, Any] | None = None) ->
 
 
 def fetch_my_issues(limit: int = 20) -> list[dict]:
-    """
-    抓目前指派給 API key 所屬使用者的 issue。
-    """
     data = _request(
         "GET",
         "/issues.json",
@@ -63,20 +60,89 @@ def fetch_my_issues(limit: int = 20) -> list[dict]:
     return data.get("issues", [])
 
 
+# ---------- Spec Parser ----------
+
+def _parse_list_block(text: str) -> list[str]:
+    items = []
+    for line in text.splitlines():
+        line = line.strip()
+        line = re.sub(r"^[-*\d\.\s]+", "", line)
+        if line:
+            items.append(line)
+    return items
+
+
+def _parse_steps(text: str) -> list[dict]:
+    steps = []
+    for line in text.splitlines():
+        line = line.strip()
+        line = re.sub(r"^\d+\.\s*", "", line)
+        if "=" in line:
+            k, v = line.split("=", 1)
+            steps.append({k.strip(): v.strip()})
+    return steps
+
+
+def parse_description(desc: str) -> dict:
+    desc = desc or ""
+
+    def block(name):
+        m = re.search(rf"\[{name}\](.*?)(?:\n\[|\Z)", desc, re.S)
+        return m.group(1).strip() if m else ""
+
+    requirements = _parse_list_block(block("Requirements"))
+
+    validation_text = block("Validation")
+    validation = {
+        "url": "/",
+        "role": "",
+        "expected": [],
+        "forbidden": [],
+        "steps": []
+    }
+
+    for line in validation_text.splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k = k.strip().lower()
+        v = v.strip()
+
+        if k == "url":
+            validation["url"] = v
+        elif k == "role":
+            validation["role"] = v
+        elif k == "expected":
+            validation["expected"] = [x.strip() for x in v.split(",") if x.strip()]
+        elif k == "forbidden":
+            validation["forbidden"] = [x.strip() for x in v.split(",") if x.strip()]
+
+    validation["steps"] = _parse_steps(block("Steps"))
+
+    return {
+        "requirements": requirements,
+        "validation": validation,
+    }
+
+
+# ---------- Public API ----------
+
 def get_first_low_priority_issue() -> dict | None:
-    """
-    抓第一張 priority = Low 且 assigned_to = me 的 ticket
-    """
     issues = fetch_my_issues(limit=50)
 
     for issue in issues:
         priority = issue.get("priority", {}) or {}
         priority_name = (priority.get("name") or "").strip().lower()
+
         if priority_name == "low":
+            parsed = parse_description(issue.get("description", ""))
+
             return {
                 "id": issue["id"],
                 "issue_id": str(issue["id"]),
-                "subject": issue.get("subject", ""),
+                "summary": issue.get("subject", ""),
+                "requirements": parsed["requirements"],
+                "validation": parsed["validation"],
                 "raw": issue,
             }
 

@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 from scripts.redmine_tool import get_first_low_priority_issue
+from scripts.workspace import get_issue_branch
 
 load_dotenv()
 
@@ -32,6 +33,7 @@ DEFAULT_AGENT_SOURCE_REPO = os.environ.get("AGENT_SOURCE_REPO", "").strip()
 DEFAULT_REPO_GIT_URL = (DEFAULT_REPO_SSH or DEFAULT_REPO_HTTPS).strip()
 APP_START_TIMEOUT = int(os.environ.get("APP_START_TIMEOUT", "600").strip())
 HEALTHCHECK_INTERVAL = int(os.environ.get("HEALTHCHECK_INTERVAL", "3").strip())
+DEFAULT_APP_PORT = int(os.environ.get("APP_PORT", "8080").strip())
 
 
 def normalize_repo_git_url() -> str:
@@ -50,6 +52,12 @@ def normalize_repo_git_url() -> str:
 
 
 DEFAULT_REPO_GIT_URL = normalize_repo_git_url()
+DEFAULT_PLAYWRIGHT_TEST_LOGIN_USERNAME = os.environ.get(
+    "PLAYWRIGHT_TEST_LOGIN_USERNAME", "tester"
+).strip() or "tester"
+DEFAULT_PLAYWRIGHT_TEST_LOGIN_CHINESE_NAME = os.environ.get(
+    "PLAYWRIGHT_TEST_LOGIN_CHINESE_NAME", "測試使用者"
+).strip() or "測試使用者"
 
 AGENT_STEPS = [
     "FETCH_ISSUE",
@@ -59,6 +67,7 @@ AGENT_STEPS = [
     "RUN_CODEX",
     "RUN_BUILD",
     "RUN_RUNTIME",
+    "GIT_COMMIT_PUSH",
     "WRITE_REPORT",
     "UPDATE_REDMINE",
     "DONE",
@@ -79,6 +88,14 @@ def set_step(report_data: dict, step: str, detail: str = ""):
     print(f"[agent][{ts}] CURRENT STEP: {step}", flush=True)
     if detail:
         print(f"[agent][{ts}] DETAIL      : {detail}", flush=True)
+    print("=" * 80, flush=True)
+
+
+def emit_completion_signal(issue_id: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print("\a", end="", flush=True)
+    print("=" * 80, flush=True)
+    print(f"[agent][{ts}] ISSUE COMPLETED SIGNAL: #{issue_id}", flush=True)
     print("=" * 80, flush=True)
 
 
@@ -117,6 +134,14 @@ def write_md(path: str | Path, report_data: dict):
     lines.append(f"- current_step: {report_data.get('current_step', '')}")
     lines.append(f"- current_step_detail: {report_data.get('current_step_detail', '')}")
     lines.append("")
+
+    modified_files = report_data.get("modified_files", []) or []
+    if modified_files:
+        lines.append("## Modified Files")
+        lines.append("")
+        for f in modified_files:
+            lines.append(f"- `{f}`")
+        lines.append("")
 
     attempts = report_data.get("attempts", [])
     for i, attempt in enumerate(attempts, 1):
@@ -174,6 +199,22 @@ def write_md(path: str | Path, report_data: dict):
             lines.append(runtime["log_tail"])
             lines.append("```")
         lines.append("")
+
+        git = attempt.get("git", {})
+        if git:
+            lines.append("### Git")
+            lines.append("")
+            lines.append(f"- executed: {git.get('executed', '')}")
+            lines.append(f"- passed: {git.get('passed', '')}")
+            lines.append(f"- branch: {git.get('branch', '')}")
+            lines.append(f"- commit_message: {git.get('commit_message', '')}")
+            lines.append(f"- summary: {git.get('summary', '')}")
+            if git.get("log_tail"):
+                lines.append("")
+                lines.append("```text")
+                lines.append(git["log_tail"])
+                lines.append("```")
+            lines.append("")
 
     redmine = report_data.get("redmine_post_update", {})
     if redmine:
@@ -256,63 +297,65 @@ def prepare_task_context(issue: dict, workspace_dir: Path):
     prompt_txt_path.write_text(build_prompt_from_issue(issue), encoding="utf-8")
 
 
-def prepare_repo(workspace_dir: Path) -> dict:
+def prepare_repo(workspace_dir: Path, issue_id: str) -> dict:
     repo_dir = workspace_dir / "repo"
+    branch_name = get_issue_branch(issue_id)
+    clone_url = DEFAULT_REPO_SSH or DEFAULT_REPO_GIT_URL
+    logs: list[str] = []
 
-    # 若 repo 已存在且非空，就直接使用
-    if repo_dir.exists() and any(repo_dir.iterdir()):
-        return {
-            "executed": True,
-            "passed": True,
-            "summary": "existing repo already present in workspace",
-        }
-
-    clone_url = DEFAULT_REPO_GIT_URL
-
-    # 優先用本地來源複製；若 AGENT_SOURCE_REPO 是遠端 repo，改走 git clone
-    if DEFAULT_AGENT_SOURCE_REPO:
-        source_repo = Path(DEFAULT_AGENT_SOURCE_REPO)
-        if source_repo.exists():
-            if repo_dir.exists():
-                shutil.rmtree(repo_dir)
-            shutil.copytree(source_repo, repo_dir)
-            return {
-                "executed": True,
-                "passed": True,
-                "summary": f"copied repo from {source_repo}",
-            }
-
-        if "://" in DEFAULT_AGENT_SOURCE_REPO or DEFAULT_AGENT_SOURCE_REPO.startswith("git@"):
-            clone_url = DEFAULT_AGENT_SOURCE_REPO
-        else:
-            return {
-                "executed": True,
-                "passed": False,
-                "summary": f"AGENT_SOURCE_REPO not found: {source_repo}",
-            }
-
-    # 否則試著 git clone
-    if clone_url:
+    def run_git(args: list[str], cwd: Path | None = None, check: bool = True):
+        workdir = cwd or repo_dir
         proc = subprocess.run(
-            ["git", "clone", clone_url, str(repo_dir)],
+            ["git", *args],
+            cwd=workdir,
             capture_output=True,
             text=True,
             check=False,
         )
+        logs.append(f"$ git {' '.join(args)}")
+        if proc.stdout:
+            logs.append(proc.stdout.strip())
+        if proc.stderr:
+            logs.append(proc.stderr.strip())
+        if check and proc.returncode != 0:
+            raise RuntimeError(proc.stderr or proc.stdout or f"git {' '.join(args)} failed")
+        return proc
+
+    try:
+        if not clone_url:
+            raise RuntimeError("REPO_SSH_URL is not configured")
+
+        if repo_dir.exists():
+            shutil.rmtree(repo_dir)
+        repo_dir.parent.mkdir(parents=True, exist_ok=True)
+
+        run_git(["clone", clone_url, str(repo_dir)], cwd=workspace_dir)
+        run_git(["switch", "develop"])
+        run_git(["fetch", "origin"])
+
+        checkout_result = run_git(["checkout", "-b", branch_name], check=False)
+        if checkout_result.returncode != 0:
+            exists = run_git(["branch", "--list", branch_name], check=False)
+            if branch_name in (exists.stdout or ""):
+                run_git(["switch", branch_name])
+            else:
+                raise RuntimeError(checkout_result.stderr or checkout_result.stdout or "git checkout -b failed")
+
         return {
             "executed": True,
-            "passed": proc.returncode == 0,
-            "returncode": proc.returncode,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-            "summary": "git clone completed" if proc.returncode == 0 else "git clone failed",
+            "passed": True,
+            "branch": branch_name,
+            "summary": "git clone, switch develop, fetch origin, checkout issue branch completed",
+            "log_tail": tail_text("\n".join(logs)),
         }
-
-    return {
-        "executed": True,
-        "passed": False,
-        "summary": "no repo source configured; set AGENT_SOURCE_REPO or AGENT_REPO_GIT_URL",
-    }
+    except Exception as e:
+        return {
+            "executed": True,
+            "passed": False,
+            "branch": branch_name,
+            "summary": str(e),
+            "log_tail": tail_text("\n".join(logs)),
+        }
 
 
 def detect_project_type(repo_dir: Path) -> str:
@@ -325,31 +368,13 @@ def detect_project_type(repo_dir: Path) -> str:
     return "unknown"
 
 
-def detect_port_from_log(log_file: Path) -> int | None:
-    if not log_file.exists():
-        return None
-
-    text = log_file.read_text(encoding="utf-8", errors="ignore")
-    patterns = [
-        r"Tomcat started on port\(s\): (\d+)",
-        r"Netty started on port (\d+)",
-        r"Local:\s+http://localhost:(\d+)",
-        r"localhost:(\d+)",
-        r"port[:= ]+(\d+)",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return int(match.group(1))
-
-    return None
-
-
 def http_ok(url: str) -> bool:
     try:
         req = Request(url, headers={"User-Agent": "agent-loop"})
         with urlopen(req, timeout=5) as resp:
+            body = resp.read(512).decode("utf-8", errors="ignore").lower()
+            if "mongodb over http on the native driver port" in body:
+                return False
             return 200 <= resp.status < 400
     except (URLError, HTTPError, TimeoutError):
         return False
@@ -360,6 +385,143 @@ def copy_runtime_log_to_report(workspace_dir: Path, log_file: Path) -> str:
     if log_file.exists():
         shutil.copy2(log_file, report_log)
     return str(report_log)
+
+
+def collect_modified_files(repo_dir: Path) -> list[str]:
+    proc = subprocess.run(
+        ["git", "status", "--short"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return []
+
+    modified_files: list[str] = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:].strip()
+        if path:
+            modified_files.append(path)
+    return modified_files
+
+
+def ensure_issue_branch(repo_dir: Path, issue_id: str) -> dict:
+    branch_name = get_issue_branch(issue_id)
+    current = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if (current.stdout or "").strip() == branch_name:
+        return {"executed": True, "passed": True, "branch": branch_name, "summary": "already on issue branch"}
+
+    exists = subprocess.run(
+        ["git", "branch", "--list", branch_name],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if branch_name in (exists.stdout or ""):
+        proc = subprocess.run(
+            ["git", "switch", branch_name],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return {
+            "executed": True,
+            "passed": proc.returncode == 0,
+            "branch": branch_name,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "summary": "switched to existing issue branch" if proc.returncode == 0 else "failed to switch issue branch",
+        }
+
+    proc = subprocess.run(
+        ["git", "checkout", "-b", branch_name],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return {
+        "executed": True,
+        "passed": proc.returncode == 0,
+        "branch": branch_name,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "summary": "created issue branch" if proc.returncode == 0 else "failed to create issue branch",
+    }
+
+
+def run_git_phase(workspace_dir: Path, issue_id: str) -> dict:
+    repo_dir = workspace_dir / "repo"
+    branch_name = get_issue_branch(issue_id)
+    commit_message = branch_name
+    logs: list[str] = []
+
+    def run_git(args: list[str], check: bool = True):
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        logs.append(f"$ git {' '.join(args)}")
+        if proc.stdout:
+            logs.append(proc.stdout.strip())
+        if proc.stderr:
+            logs.append(proc.stderr.strip())
+        if check and proc.returncode != 0:
+            raise RuntimeError(proc.stderr or proc.stdout or f"git {' '.join(args)} failed")
+        return proc
+
+    try:
+        branch_result = ensure_issue_branch(repo_dir, issue_id)
+        logs.append(branch_result.get("summary", ""))
+        if not branch_result.get("passed", False):
+            raise RuntimeError(branch_result.get("stderr") or branch_result.get("summary") or "failed to prepare branch")
+
+        run_git(["add", "."])
+        commit_result = run_git(["commit", "-m", commit_message], check=False)
+        commit_stdout = (commit_result.stdout or "").lower()
+        commit_stderr = (commit_result.stderr or "").lower()
+        if commit_result.returncode != 0 and "nothing to commit" not in commit_stdout and "nothing to commit" not in commit_stderr:
+            raise RuntimeError(commit_result.stderr or commit_result.stdout or "git commit failed")
+
+        run_git(["fetch", "origin"], check=False)
+        rebase_result = run_git(["rebase", "origin/develop"], check=False)
+        if rebase_result.returncode != 0:
+            raise RuntimeError(
+                "git rebase origin/develop failed. Resolve conflicts, then run: git add . ; git rebase --continue"
+            )
+
+        run_git(["push", "-u", "origin", branch_name])
+        return {
+            "executed": True,
+            "passed": True,
+            "branch": branch_name,
+            "commit_message": commit_message,
+            "summary": "git add/commit/rebase/push completed",
+            "log_tail": tail_text("\n".join(logs)),
+        }
+    except Exception as e:
+        return {
+            "executed": True,
+            "passed": False,
+            "branch": branch_name,
+            "commit_message": commit_message,
+            "summary": str(e),
+            "log_tail": tail_text("\n".join(logs)),
+        }
 
 
 def start_app(workspace_dir: Path) -> dict:
@@ -428,30 +590,28 @@ def stop_app(pid: str):
 def wait_for_app(runtime: dict) -> dict:
     log_file = Path(runtime["log_file"])
     started_at = time.time()
-    port = None
+    port = DEFAULT_APP_PORT
 
     while time.time() - started_at < APP_START_TIMEOUT:
-        port = detect_port_from_log(log_file)
-        if port:
-            for path in ("/actuator/health", "/health", "/"):
-                url = f"http://127.0.0.1:{port}{path}"
-                if http_ok(url):
-                    return {
-                        "ready": True,
-                        "passed": True,
-                        "port": port,
-                        "base_url": f"http://127.0.0.1:{port}",
-                        "health_url": url,
-                        "log_file": str(log_file),
-                        "summary": f"app ready on port {port}",
-                    }
+        for path in ("/actuator/health", "/health", "/"):
+            url = f"http://localhost:{port}{path}"
+            if http_ok(url):
+                return {
+                    "ready": True,
+                    "passed": True,
+                    "port": port,
+                    "base_url": f"http://localhost:{port}",
+                    "health_url": url,
+                    "log_file": str(log_file),
+                    "summary": f"app ready on port {port}",
+                }
         time.sleep(HEALTHCHECK_INTERVAL)
 
     return {
         "ready": False,
         "passed": False,
         "port": port,
-        "base_url": f"http://127.0.0.1:{port}" if port else "",
+        "base_url": f"http://localhost:{port}" if port else "",
         "health_url": "",
         "log_file": str(log_file),
         "summary": "app did not become ready before timeout",
@@ -461,11 +621,22 @@ def wait_for_app(runtime: dict) -> dict:
 def run_playwright_capture(workspace_dir: Path, base_url: str) -> dict:
     repo_dir = workspace_dir / "repo"
     output_dir = workspace_dir / "report" / "screenshots"
+    storage_state_path = output_dir / "auth-state.json"
     output_dir.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["PLAYWRIGHT_TEST_LOGIN_USERNAME"] = DEFAULT_PLAYWRIGHT_TEST_LOGIN_USERNAME
+    env["PLAYWRIGHT_TEST_LOGIN_CHINESE_NAME"] = DEFAULT_PLAYWRIGHT_TEST_LOGIN_CHINESE_NAME
 
     proc = subprocess.run(
-        [sys.executable, str(Path(__file__).with_name("playwright_runner.py")), base_url, str(output_dir)],
+        [
+            sys.executable,
+            str(Path(__file__).with_name("playwright_runner.py")),
+            base_url,
+            str(output_dir),
+            str(storage_state_path),
+        ],
         cwd=repo_dir,
+        env=env,
         capture_output=True,
         text=True,
         check=False,
@@ -651,12 +822,14 @@ def run_agent_for_issue(issue: dict):
             "mvn package",
             "java -jar target/*.jar",
         ],
+        "modified_files": [],
     }
 
     attempt = {
         "codex": {},
         "build": {},
         "runtime": {},
+        "git": {},
     }
 
     try:
@@ -670,15 +843,22 @@ def run_agent_for_issue(issue: dict):
         write_md(report_md_path, report_data)
 
         set_step(report_data, "PREPARE_REPO", "prepare repo into workspace/repo")
-        repo_result = prepare_repo(workspace_dir)
+        repo_result = prepare_repo(workspace_dir, issue_id)
         report_data["repo_prepare"] = repo_result
         if not repo_result.get("passed", False):
             raise RuntimeError(f"repo prepare failed: {repo_result.get('summary', '')}")
+        branch_result = ensure_issue_branch(workspace_dir / "repo", issue_id)
+        report_data["branch_prepare"] = branch_result
+        if not branch_result.get("passed", False):
+            raise RuntimeError(f"branch prepare failed: {branch_result.get('summary', '')}")
         write_json(report_json_path, report_data)
         write_md(report_md_path, report_data)
 
         set_step(report_data, "RUN_CODEX", f"issue #{issue_id}")
         attempt["codex"] = run_codex_phase_stub(workspace_dir, issue)
+        report_data["modified_files"] = collect_modified_files(workspace_dir / "repo")
+        if report_data["modified_files"] and not attempt["codex"].get("modified_files"):
+            attempt["codex"]["modified_files"] = report_data["modified_files"]
         write_json(report_json_path, report_data)
         write_md(report_md_path, report_data)
 
@@ -690,13 +870,30 @@ def run_agent_for_issue(issue: dict):
         set_step(report_data, "RUN_RUNTIME", "start app, wait for readiness, capture screenshot")
         attempt["runtime"] = run_runtime_phase(workspace_dir)
 
+        report_data["modified_files"] = collect_modified_files(workspace_dir / "repo")
+        if report_data["modified_files"]:
+            attempt["codex"]["modified_files"] = report_data["modified_files"]
         report_data["attempts"] = [attempt]
         report_data["final_passed"] = (
             attempt["codex"].get("passed", False)
             and attempt["build"].get("passed", False)
             and attempt["runtime"].get("passed", False)
         )
-
+        if report_data["final_passed"]:
+            set_step(report_data, "GIT_COMMIT_PUSH", "add commit rebase push")
+            git_result = run_git_phase(workspace_dir, issue_id)
+            attempt["git"] = git_result
+            report_data["git"] = git_result
+            report_data["final_passed"] = git_result.get("passed", False)
+        else:
+            report_data["git"] = {
+                "executed": False,
+                "passed": False,
+                "branch": get_issue_branch(issue_id),
+                "commit_message": get_issue_branch(issue_id),
+                "summary": "skipped because build/runtime validation did not pass",
+            }
+        
         set_step(report_data, "WRITE_REPORT", "write final report")
         write_json(report_json_path, report_data)
         write_md(report_md_path, report_data)
@@ -717,6 +914,7 @@ def run_agent_for_issue(issue: dict):
         write_md(report_md_path, report_data)
 
         print(f"[agent] completed issue #{issue_id}", flush=True)
+        emit_completion_signal(issue_id)
         return report_data
 
     except Exception as e:
@@ -731,16 +929,21 @@ def run_agent_for_issue(issue: dict):
 
 def main():
     print("[agent] autonomous queue runner started", flush=True)
+    print("[agent] continuous-run mode: keep fetching issues until queue is empty", flush=True)
 
-    print("[agent] fetching assigned low-priority issues...", flush=True)
-    issue = get_first_low_priority_issue()
+    while True:
+        print("[agent] fetching assigned low-priority issues...", flush=True)
+        issue = get_first_low_priority_issue()
 
-    if not issue:
-        print("[agent] no assigned low-priority issue found", flush=True)
-        return
+        if not issue:
+            print("[agent] no assigned low-priority issue found; stopping runner", flush=True)
+            return
 
-    print(f"[agent] picked issue #{issue['issue_id']} - {issue.get('subject', '')}", flush=True)
-    run_agent_for_issue(issue)
+        print(
+            f"[agent] picked issue #{issue['issue_id']} - {issue.get('subject', '')}",
+            flush=True,
+        )
+        run_agent_for_issue(issue)
 
 
 if __name__ == "__main__":
