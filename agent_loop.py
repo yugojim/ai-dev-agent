@@ -136,20 +136,22 @@ def write_md(path: str | Path, report_data: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
 
     lines = []
-    lines.append("# Agent Report")
+    lines.append("# 執行報告")
     lines.append("")
-    lines.append(f"- issue_id: {report_data.get('issue_id', '')}")
-    lines.append(f"- mode: {report_data.get('mode', '')}")
-    lines.append(f"- attempt_count: {report_data.get('attempt_count', '')}")
-    lines.append(f"- final_passed: {report_data.get('final_passed', '')}")
-    lines.append(f"- generated_at: {report_data.get('generated_at', '')}")
-    lines.append(f"- current_step: {report_data.get('current_step', '')}")
-    lines.append(f"- current_step_detail: {report_data.get('current_step_detail', '')}")
+    lines.append("## 處理結果")
+    lines.append("")
+    lines.append(f"- Issue 編號: {report_data.get('issue_id', '')}")
+    lines.append(f"- 執行模式: {report_data.get('mode', '')}")
+    lines.append(f"- 嘗試次數: {report_data.get('attempt_count', '')}")
+    lines.append(f"- 最終是否通過: {report_data.get('final_passed', '')}")
+    lines.append(f"- 報告產生時間: {report_data.get('generated_at', '')}")
+    lines.append(f"- 目前步驟: {report_data.get('current_step', '')}")
+    lines.append(f"- 步驟說明: {report_data.get('current_step_detail', '')}")
     lines.append("")
 
     modified_files = report_data.get("modified_files", []) or []
     if modified_files:
-        lines.append("## Modified Files")
+        lines.append("## Codex 變更檔案")
         lines.append("")
         for f in modified_files:
             lines.append(f"- `{f}`")
@@ -157,7 +159,7 @@ def write_md(path: str | Path, report_data: dict):
 
     attempts = report_data.get("attempts", [])
     for i, attempt in enumerate(attempts, 1):
-        lines.append(f"## Attempt {i}")
+        lines.append(f"## 第 {i} 次嘗試")
         lines.append("")
 
         codex = attempt.get("codex", {})
@@ -166,26 +168,26 @@ def write_md(path: str | Path, report_data: dict):
 
         lines.append("### Codex")
         lines.append("")
-        lines.append(f"- executed: {codex.get('executed', '')}")
-        lines.append(f"- passed: {codex.get('passed', '')}")
-        lines.append(f"- returncode: {codex.get('returncode', '')}")
-        lines.append(f"- summary: {codex.get('summary', '')}")
-        modified_files = codex.get("modified_files", []) or []
-        if modified_files:
+        lines.append(f"- 是否執行: {codex.get('executed', '')}")
+        lines.append(f"- 是否通過: {codex.get('passed', '')}")
+        lines.append(f"- 返回碼: {codex.get('returncode', '')}")
+        lines.append(f"- 摘要: {codex.get('summary', '')}")
+        codex_modified_files = codex.get("modified_files", []) or []
+        if codex_modified_files:
             lines.append("")
-            lines.append("#### Modified Files")
+            lines.append("#### Codex 變更檔案")
             lines.append("")
-            for f in modified_files:
+            for f in codex_modified_files:
                 lines.append(f"- `{f}`")
         lines.append("")
 
-        lines.append("### Build")
+        lines.append("### 建置")
         lines.append("")
-        lines.append(f"- executed: {build.get('executed', '')}")
-        lines.append(f"- passed: {build.get('passed', '')}")
-        lines.append(f"- returncode: {build.get('returncode', '')}")
-        lines.append(f"- classification: {build.get('classification', '')}")
-        lines.append(f"- summary: {build.get('summary', '')}")
+        lines.append(f"- 是否執行: {build.get('executed', '')}")
+        lines.append(f"- 是否通過: {build.get('passed', '')}")
+        lines.append(f"- 返回碼: {build.get('returncode', '')}")
+        lines.append(f"- 分類: {build.get('classification', '')}")
+        lines.append(f"- 摘要: {build.get('summary', '')}")
         if build.get("log_tail"):
             lines.append("")
             lines.append("```text")
@@ -193,18 +195,18 @@ def write_md(path: str | Path, report_data: dict):
             lines.append("```")
         lines.append("")
 
-        lines.append("### Runtime")
+        lines.append("### 執行驗證")
         lines.append("")
-        lines.append(f"- executed: {runtime.get('executed', '')}")
-        lines.append(f"- ready: {runtime.get('ready', '')}")
-        lines.append(f"- passed: {runtime.get('passed', '')}")
-        lines.append(f"- port: {runtime.get('port', '')}")
-        lines.append(f"- base_url: {runtime.get('base_url', '')}")
-        lines.append(f"- health_url: {runtime.get('health_url', '')}")
-        lines.append(f"- runtime_log: {runtime.get('runtime_log', '')}")
-        lines.append(f"- screenshot: {runtime.get('screenshot', '')}")
-        lines.append(f"- console_log: {runtime.get('console_log', '')}")
-        lines.append(f"- summary: {runtime.get('summary', '')}")
+        lines.append(f"- 是否執行: {runtime.get('executed', '')}")
+        lines.append(f"- 是否就緒: {runtime.get('ready', '')}")
+        lines.append(f"- 是否通過: {runtime.get('passed', '')}")
+        lines.append(f"- Port: {runtime.get('port', '')}")
+        lines.append(f"- Base URL: {runtime.get('base_url', '')}")
+        lines.append(f"- Health URL: {runtime.get('health_url', '')}")
+        lines.append(f"- 執行記錄: {runtime.get('runtime_log', '')}")
+        lines.append(f"- 截圖: {runtime.get('screenshot', '')}")
+        lines.append(f"- Console Log: {runtime.get('console_log', '')}")
+        lines.append(f"- 摘要: {runtime.get('summary', '')}")
         if runtime.get("log_tail"):
             lines.append("")
             lines.append("```text")
@@ -216,11 +218,11 @@ def write_md(path: str | Path, report_data: dict):
         if git:
             lines.append("### Git")
             lines.append("")
-            lines.append(f"- executed: {git.get('executed', '')}")
-            lines.append(f"- passed: {git.get('passed', '')}")
-            lines.append(f"- branch: {git.get('branch', '')}")
-            lines.append(f"- commit_message: {git.get('commit_message', '')}")
-            lines.append(f"- summary: {git.get('summary', '')}")
+            lines.append(f"- 是否執行: {git.get('executed', '')}")
+            lines.append(f"- 是否通過: {git.get('passed', '')}")
+            lines.append(f"- 分支: {git.get('branch', '')}")
+            lines.append(f"- Commit 訊息: {git.get('commit_message', '')}")
+            lines.append(f"- 摘要: {git.get('summary', '')}")
             if git.get("log_tail"):
                 lines.append("")
                 lines.append("```text")
@@ -230,16 +232,16 @@ def write_md(path: str | Path, report_data: dict):
 
     redmine = report_data.get("redmine_post_update", {})
     if redmine:
-        lines.append("## Redmine Post Update")
+        lines.append("## Redmine 回寫結果")
         lines.append("")
-        lines.append(f"- executed: {redmine.get('executed', '')}")
-        lines.append(f"- passed: {redmine.get('passed', '')}")
-        lines.append(f"- returncode: {redmine.get('returncode', '')}")
-        lines.append(f"- error: {redmine.get('error', '')}")
+        lines.append(f"- 是否執行: {redmine.get('executed', '')}")
+        lines.append(f"- 是否通過: {redmine.get('passed', '')}")
+        lines.append(f"- 返回碼: {redmine.get('returncode', '')}")
+        lines.append(f"- 錯誤: {redmine.get('error', '')}")
         lines.append("")
 
     if report_data.get("error"):
-        lines.append("## Error")
+        lines.append("## 未完成原因 / 錯誤")
         lines.append("")
         lines.append("```text")
         lines.append(report_data["error"])

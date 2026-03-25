@@ -32,10 +32,13 @@ class CodexRunner:
         codex_bin: str = "codex",
         model: str = "gpt-5.4",
         reasoning_effort: str = "medium",
+        sandbox_mode: Optional[str] = None,
     ):
         self.codex_bin = codex_bin
         self.model = model
         self.reasoning_effort = reasoning_effort
+        # Allow the caller or environment to tune Codex execution permission level.
+        self.sandbox_mode = sandbox_mode or os.getenv("CODEX_SANDBOX_MODE", "danger-full-access")
 
     def build_command(self, prompt: str, repo_dir: Path) -> List[str]:
         """
@@ -48,7 +51,7 @@ class CodexRunner:
             "exec",
             "-m", self.model,
             "-c", f"reasoning_effort={self.reasoning_effort}",
-            "-s", "workspace-write",
+            "-s", self.sandbox_mode,
             "-C", str(repo_dir),
             prompt,
         ]
@@ -73,7 +76,7 @@ class CodexRunner:
             stderr=proc.stderr,
             workspace=str(repo_dir),
             modified_files=modified,
-            invocation_style="exec-subcommand-sandbox",
+            invocation_style=f"exec-subcommand-sandbox:{self.sandbox_mode}",
         )
 
     @staticmethod

@@ -163,7 +163,7 @@ The runtime flow is now designed for both macOS and Windows:
 
 ```bash
 codex --help
-codex exec -m gpt-5.4 -s workspace-write -C /path/to/repo "Fix the Redmine issue in task_context/prompt.txt"
+codex exec -m gpt-5.4 -s danger-full-access -C /path/to/repo "Fix the Redmine issue in task_context/prompt.txt"
 ```
 
 ## 9. Security
