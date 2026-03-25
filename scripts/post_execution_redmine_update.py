@@ -18,12 +18,12 @@ load_dotenv()
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Upload agent artifacts to Redmine and update issue fields."
+        description="將 agent 執行產物上傳到 Redmine，並更新議題欄位。"
     )
-    parser.add_argument("--issue-id", required=True, help="Redmine issue id")
-    parser.add_argument("--workspace-dir", required=True, help="Workspace dir")
-    parser.add_argument("--status-id", required=True, type=int, help="Status id")
-    parser.add_argument("--priority-id", required=True, type=int, help="Priority id")
+    parser.add_argument("--issue-id", required=True, help="Redmine 議題編號")
+    parser.add_argument("--workspace-dir", required=True, help="工作目錄路徑")
+    parser.add_argument("--status-id", required=True, type=int, help="狀態編號")
+    parser.add_argument("--priority-id", required=True, type=int, help="優先級編號")
     parser.add_argument("--no-report-json", action="store_true")
     parser.add_argument("--no-report-md", action="store_true")
     parser.add_argument("--no-screenshots", action="store_true")
@@ -36,7 +36,7 @@ def main():
     workspace_dir = Path(args.workspace_dir)
 
     if not workspace_dir.exists():
-        print(f"workspace_dir not found: {workspace_dir}", file=sys.stderr)
+        print(f"找不到工作目錄：{workspace_dir}", file=sys.stderr)
         return 2
 
     try:
@@ -53,10 +53,10 @@ def main():
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     except RedmineWriterError as e:
-        print(f"RedmineWriterError: {e}", file=sys.stderr)
+        print(f"Redmine 回寫錯誤：{e}", file=sys.stderr)
         return 3
     except Exception as e:
-        print(f"{type(e).__name__}: {e}", file=sys.stderr)
+        print(f"未預期錯誤 {type(e).__name__}：{e}", file=sys.stderr)
         return 4
 
 

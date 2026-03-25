@@ -233,12 +233,13 @@ def build_agent_comment(
     generated_at = report.get("generated_at", "")
 
     lines: list[str] = []
-    lines.append(f"Agent execution update for issue #{issue_id}")
+    lines.append(f"Issue #{issue_id} 執行更新報告")
     lines.append("")
-    lines.append(f"- mode: {mode}")
-    lines.append(f"- attempt_count: {attempt_count}")
-    lines.append(f"- final_passed: {final_passed}")
-    lines.append(f"- generated_at: {generated_at}")
+    lines.append("處理結果：")
+    lines.append(f"- 執行模式: {mode}")
+    lines.append(f"- 嘗試次數: {attempt_count}")
+    lines.append(f"- 最終是否通過: {final_passed}")
+    lines.append(f"- 報告產生時間: {generated_at}")
 
     attempts = report.get("attempts", [])
     if attempts:
@@ -250,33 +251,33 @@ def build_agent_comment(
         modified_files = codex.get("modified_files", []) or []
         if modified_files:
             lines.append("")
-            lines.append("Modified files:")
+            lines.append("Codex 變更檔案：")
             for f in modified_files[:20]:
                 lines.append(f"- {f}")
             if len(modified_files) > 20:
-                lines.append(f"- ... and {len(modified_files) - 20} more")
+                lines.append(f"- 其餘尚有 {len(modified_files) - 20} 個檔案未展開")
 
         lines.append("")
-        lines.append("Execution summary:")
-        lines.append(f"- codex_returncode: {codex.get('returncode', '')}")
-        lines.append(f"- build_passed: {build.get('passed', '')}")
-        lines.append(f"- build_returncode: {build.get('returncode', '')}")
-        lines.append(f"- runtime_ready: {runtime.get('ready', '')}")
-        lines.append(f"- runtime_passed: {runtime.get('passed', '')}")
+        lines.append("執行摘要：")
+        lines.append(f"- Codex 返回碼: {codex.get('returncode', '')}")
+        lines.append(f"- 建置是否通過: {build.get('passed', '')}")
+        lines.append(f"- 建置返回碼: {build.get('returncode', '')}")
+        lines.append(f"- 執行環境是否就緒: {runtime.get('ready', '')}")
+        lines.append(f"- 執行驗證是否通過: {runtime.get('passed', '')}")
         if runtime.get("base_url"):
-            lines.append(f"- runtime_base_url: {runtime.get('base_url')}")
+            lines.append(f"- 執行 Base URL: {runtime.get('base_url')}")
         if runtime.get("health_url"):
-            lines.append(f"- runtime_health_url: {runtime.get('health_url')}")
+            lines.append(f"- 健康檢查 URL: {runtime.get('health_url')}")
 
     screenshot_paths = screenshot_paths or []
     if screenshot_paths:
         lines.append("")
-        lines.append("Attached screenshots:")
+        lines.append("附加截圖：")
         for s in screenshot_paths[:10]:
             lines.append(f"- {Path(s).name}")
 
     lines.append("")
-    lines.append("Attachments uploaded by agent:")
+    lines.append("Agent 上傳附件：")
     if Path(report_md_path).exists():
         lines.append(f"- {Path(report_md_path).name}")
     if Path(report_json_path).exists():
