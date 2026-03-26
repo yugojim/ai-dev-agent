@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -44,6 +45,20 @@ def _request(method: str, path: str, *, params: dict[str, Any] | None = None) ->
         )
 
     return resp.json()
+
+
+def _download(url: str, output_path: Path) -> None:
+    headers = {"X-Redmine-API-Key": REDMINE_API_KEY}
+    resp = requests.get(
+        url,
+        headers=headers,
+        timeout=120,
+        verify=REDMINE_VERIFY_SSL,
+    )
+    if resp.status_code != 200:
+        raise RedmineToolError(f"Attachment download failed {resp.status_code} for {url}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(resp.content)
 
 
 def fetch_my_issues(limit: int = 20) -> list[dict]:
@@ -125,7 +140,48 @@ def parse_description(desc: str) -> dict:
     }
 
 
+def build_issue_payload(issue: dict) -> dict:
+    parsed = parse_description(issue.get("description", ""))
+    return {
+        "id": issue["id"],
+        "issue_id": str(issue["id"]),
+        "summary": issue.get("subject", ""),
+        "requirements": parsed["requirements"],
+        "validation": parsed["validation"],
+        "raw": issue,
+    }
+
+
 # ---------- Public API ----------
+
+def get_issue_detail(issue_id: int | str) -> dict:
+    data = _request(
+        "GET",
+        f"/issues/{issue_id}.json",
+        params={"include": "attachments"},
+    )
+    issue = data.get("issue")
+    if not issue:
+        raise RedmineToolError(f"Issue not found: {issue_id}")
+    return issue
+
+
+def download_issue_attachments(issue_id: int | str, output_dir: str | Path) -> list[str]:
+    issue = get_issue_detail(issue_id)
+    attachments = issue.get("attachments", []) or []
+    output_dir = Path(output_dir)
+    downloaded: list[str] = []
+
+    for attachment in attachments:
+        filename = (attachment.get("filename") or "").strip()
+        content_url = (attachment.get("content_url") or "").strip()
+        if not filename or not content_url:
+            continue
+        output_path = output_dir / filename
+        _download(content_url, output_path)
+        downloaded.append(str(output_path))
+
+    return downloaded
 
 def get_first_low_priority_issue() -> dict | None:
     issues = fetch_my_issues(limit=50)
@@ -135,16 +191,7 @@ def get_first_low_priority_issue() -> dict | None:
         priority_name = (priority.get("name") or "").strip().lower()
 
         if priority_name == "low":
-            parsed = parse_description(issue.get("description", ""))
-
-            return {
-                "id": issue["id"],
-                "issue_id": str(issue["id"]),
-                "summary": issue.get("subject", ""),
-                "requirements": parsed["requirements"],
-                "validation": parsed["validation"],
-                "raw": issue,
-            }
+            return build_issue_payload(get_issue_detail(issue["id"]))
 
     return None
 
