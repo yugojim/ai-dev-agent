@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -13,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.config import resolve_workspace_base_dir
 
 DEFAULT_WORKSPACE_ROOT = resolve_workspace_base_dir(os.environ.get("WORKSPACE_BASE_DIR", ""))
+DEFAULT_NEW_BRANCH = date.today().isoformat()
 
 
 def get_issue_branch(issue_no: int | str) -> str:
@@ -146,8 +148,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--new-branch",
-        required=True,
-        help="Name of the new integration branch to create",
+        default=DEFAULT_NEW_BRANCH,
+        help=f"Name of the new integration branch to create (default: today's date, {DEFAULT_NEW_BRANCH})",
     )
     parser.add_argument(
         "--output-repo",
