@@ -14,9 +14,15 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from codex_runner import CodexRunner
 from dotenv import load_dotenv
 from scripts.config import resolve_workspace_base_dir
-from scripts.redmine_tool import get_first_low_priority_issue
+from scripts.redmine_tool import (
+    build_issue_payload,
+    download_issue_attachments,
+    get_first_low_priority_issue,
+    get_issue_detail,
+)
 from scripts.workspace import get_issue_branch
 
 load_dotenv()
@@ -70,6 +76,9 @@ DEFAULT_PLAYWRIGHT_TEST_LOGIN_USERNAME = os.environ.get(
 DEFAULT_PLAYWRIGHT_TEST_LOGIN_CHINESE_NAME = os.environ.get(
     "PLAYWRIGHT_TEST_LOGIN_CHINESE_NAME", "測試使用者"
 ).strip() or "測試使用者"
+DEFAULT_CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.4").strip() or "gpt-5.4"
+DEFAULT_CODEX_REASONING_EFFORT = os.environ.get("CODEX_REASONING_EFFORT", "medium").strip() or "medium"
+DEFAULT_CODEX_BIN = os.environ.get("CODEX_BIN", "codex").strip() or "codex"
 
 AGENT_STEPS = [
     "FETCH_ISSUE",
@@ -252,9 +261,39 @@ def write_md(path: str | Path, report_data: dict):
 
 
 def build_prompt_from_issue(issue: dict) -> str:
-    subject = issue.get("subject", "")
+    subject = issue.get("summary", "") or issue.get("subject", "")
     raw = issue.get("raw", {})
     description = raw.get("description", "")
+    requirements = issue.get("requirements", []) or []
+    validation = issue.get("validation", {}) or {}
+    attachment_files = issue.get("downloaded_attachments", []) or []
+    raw_attachments = raw.get("attachments", []) or []
+
+    requirement_lines = "\n".join(f"- {item}" for item in requirements) if requirements else "- No structured requirements were parsed from the Redmine description."
+    validation_lines = "\n".join(
+        [
+            f"- URL: {validation.get('url', '/')}",
+            f"- Role: {validation.get('role', '') or '(not specified)'}",
+            f"- Expected: {', '.join(validation.get('expected', [])) or '(none)'}",
+            f"- Forbidden: {', '.join(validation.get('forbidden', [])) or '(none)'}",
+        ]
+    )
+    steps = validation.get("steps", []) or []
+    step_lines = (
+        "\n".join(f"- {json.dumps(step, ensure_ascii=False)}" for step in steps)
+        if steps
+        else "- No structured steps were parsed from the Redmine description."
+    )
+    attachment_lines = []
+    for path in attachment_files:
+        attachment_lines.append(f"- {path}")
+    if not attachment_lines:
+        for attachment in raw_attachments:
+            filename = attachment.get("filename", "")
+            if filename:
+                attachment_lines.append(f"- attachments/{filename} (referenced by Redmine, may require download)")
+    if not attachment_lines:
+        attachment_lines.append("- No attachments downloaded.")
 
     return f"""Please read these files first:
 - task_context/issue.json
@@ -268,6 +307,18 @@ Issue subject:
 
 Issue description:
 {description}
+
+Structured requirements:
+{requirement_lines}
+
+Validation targets:
+{validation_lines}
+
+Validation steps:
+{step_lines}
+
+Available attachments:
+{chr(10).join(attachment_lines)}
 
 Rules:
 1. Keep changes minimal and limited to this ticket.
@@ -286,6 +337,12 @@ Do not propose pseudo-code.
 You must actually write and apply the patch.
 If no file is modified, the task will be considered FAILED.
 """.strip()
+
+
+def prepare_attachments(issue_id: str, workspace_dir: Path) -> list[str]:
+    attachments_dir = workspace_dir / "attachments"
+    downloaded = download_issue_attachments(issue_id, attachments_dir)
+    return [str(Path(path).resolve()) for path in downloaded]
 
 
 def prepare_workspace(issue_id: str) -> Path:
@@ -723,18 +780,29 @@ def run_playwright_capture(workspace_dir: Path, base_url: str) -> dict:
     }
 
 
-def run_codex_phase_stub(workspace_dir: Path, issue: dict) -> dict:
-    """
-    先用 stub 跑通流程。
-    之後你把這段替換成真正的 codex_runner 呼叫即可。
-    """
+def run_codex_phase(workspace_dir: Path, issue: dict) -> dict:
+    repo_dir = workspace_dir / "repo"
     prompt_path = workspace_dir / "task_context" / "prompt.txt"
+    prompt = prompt_path.read_text(encoding="utf-8")
+    runner = CodexRunner(
+        codex_bin=DEFAULT_CODEX_BIN,
+        model=DEFAULT_CODEX_MODEL,
+        reasoning_effort=DEFAULT_CODEX_REASONING_EFFORT,
+    )
+    result = runner.run(prompt, repo_dir)
+    summary = "codex phase passed" if result.returncode == 0 else "codex phase failed"
     return {
         "executed": True,
-        "passed": True,
-        "returncode": 0,
-        "summary": f"stub codex phase; prompt prepared at {prompt_path}",
-        "modified_files": [],
+        "passed": result.returncode == 0,
+        "returncode": result.returncode,
+        "command": CodexRunner.shell(result.command),
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "log_tail": tail_text((result.stderr or "") + "\n" + (result.stdout or "")),
+        "summary": summary,
+        "modified_files": result.modified_files,
+        "workspace": result.workspace,
+        "invocation_style": result.invocation_style,
     }
 
 
@@ -861,6 +929,7 @@ def post_update_redmine(issue_id: str, workspace_dir: Path) -> dict:
 
 
 def run_agent_for_issue(issue: dict):
+    issue = build_issue_payload(get_issue_detail(issue["issue_id"]))
     issue_id = str(issue["issue_id"])
     workspace_dir = prepare_workspace(issue_id)
 
@@ -896,6 +965,12 @@ def run_agent_for_issue(issue: dict):
         write_json(report_json_path, report_data)
         write_md(report_md_path, report_data)
 
+        set_step(report_data, "FETCH_ISSUE", f"refresh issue #{issue_id} details and attachments")
+        issue["downloaded_attachments"] = prepare_attachments(issue_id, workspace_dir)
+        report_data["downloaded_attachments"] = issue["downloaded_attachments"]
+        write_json(report_json_path, report_data)
+        write_md(report_md_path, report_data)
+
         set_step(report_data, "PREPARE_TASK_CONTEXT", "write issue.json and prompt.txt")
         prepare_task_context(issue, workspace_dir)
         write_json(report_json_path, report_data)
@@ -914,14 +989,14 @@ def run_agent_for_issue(issue: dict):
         write_md(report_md_path, report_data)
 
         set_step(report_data, "RUN_CODEX", f"issue #{issue_id}")
-        attempt["codex"] = run_codex_phase_stub(workspace_dir, issue)
+        attempt["codex"] = run_codex_phase(workspace_dir, issue)
         report_data["modified_files"] = collect_modified_files(workspace_dir / "repo")
         if report_data["modified_files"] and not attempt["codex"].get("modified_files"):
             attempt["codex"]["modified_files"] = report_data["modified_files"]
         write_json(report_json_path, report_data)
         write_md(report_md_path, report_data)
 
-        set_step(report_data, "RUN_BUILD", "stub build phase")
+        set_step(report_data, "RUN_BUILD", "run build validation")
         attempt["build"] = run_build_phase(workspace_dir)
         write_json(report_json_path, report_data)
         write_md(report_md_path, report_data)
@@ -999,7 +1074,7 @@ def main():
             return
 
         print(
-            f"[agent] picked issue #{issue['issue_id']} - {issue.get('subject', '')}",
+            f"[agent] picked issue #{issue['issue_id']} - {issue.get('summary', '') or issue.get('subject', '')}",
             flush=True,
         )
         run_agent_for_issue(issue)

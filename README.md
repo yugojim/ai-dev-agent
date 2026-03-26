@@ -138,17 +138,18 @@ python agent_loop.py
 The loop currently performs this flow:
 
 1. Fetch one issue from Redmine.
-2. Create `issue-<id>` workspace folders.
-3. Write `task_context/issue.json` and `task_context/prompt.txt`.
-4. Clone the repository into `workspace/repo`.
-5. Create or switch to `feat/<issue_id>`.
-6. Run the current Codex phase stub.
-7. Run build validation.
-8. Start the app locally.
-9. Wait for health checks on `http://localhost:<APP_PORT>`.
-10. Run Playwright capture and save runtime artifacts.
-11. If checks pass, commit, rebase, and push.
-12. Upload the report back to Redmine.
+2. Refresh the full issue detail and download attachments.
+3. Create `issue-<id>` workspace folders.
+4. Write `task_context/issue.json` and `task_context/prompt.txt`.
+5. Clone the repository into `workspace/repo`.
+6. Create or switch to `feat/<issue_id>`.
+7. Run Codex CLI against the generated prompt.
+8. Run build validation.
+9. Start the app locally.
+10. Wait for health checks on `http://localhost:<APP_PORT>`.
+11. Run Playwright capture and save runtime artifacts.
+12. If checks pass, commit, rebase, and push.
+13. Upload the report back to Redmine.
 
 ## 7. Cross-platform behavior
 
@@ -166,7 +167,63 @@ codex --help
 codex exec -m gpt-5.4 -s danger-full-access -C /path/to/repo "Fix the Redmine issue in task_context/prompt.txt"
 ```
 
-## 9. Security
+## 9. Recommended Redmine issue format
+
+The parser currently reads these sections from the issue description:
+
+- `[Requirements]`
+- `[Validation]`
+- `[Steps]`
+
+For UI text-change tickets, do not rely on screenshots alone. Always include the old text, the new text, and the affected screens in plain text.
+
+Use this template:
+
+```text
+[Summary]
+將新案申請書與 PI 回覆頁面的附件欄位標題由「備註」改為「說明」
+
+[Problem]
+目前附件欄位標題顯示為「備註」，與最新流程文件不一致，使用者容易誤解欄位用途。
+
+[Goal]
+相關頁面的附件欄位標題統一顯示為「說明」。
+
+[Requirements]
+- 新案申請書頁面的附件欄位標題由「備註」改為「說明」
+- PI 回覆頁面的附件欄位標題由「備註」改為「說明」
+- 僅修改本票指定畫面的顯示文字，不調整其他流程或欄位
+
+[Validation]
+URL: /
+Role: reviewer
+Expected: 說明
+Forbidden: 備註
+
+[Steps]
+1. open=新案申請書
+2. check=附件欄位標題顯示「說明」
+3. open=PI回覆
+4. check=附件欄位標題顯示「說明」
+
+[Scope]
+- 僅調整附件欄位標題
+- 不修改資料結構、API、權限或版面配置
+
+[Notes]
+- 若附上截圖，請同步在文字敘述中寫清楚紅框位置與新舊文案
+- 若系統使用 i18n/message key，請優先修改對應字串來源，不要直接硬寫在畫面元件內
+```
+
+Issue writing rules:
+
+- 每個需求都要能直接轉成程式修改，不要只寫「如附件」
+- 每個畫面都要分開列出，避免模型自行推論影響範圍
+- `Expected` / `Forbidden` 要填可比對的字串
+- `Steps` 要描述真實操作，不要只寫「進入頁面後確認」
+- 若附件是唯一資訊來源，請另外補一段文字摘要，說明紅框位置與預期結果
+
+## 10. Security
 
 - Rotate any secret that was ever pasted into chat.
 - Keep secrets only in `.env`.
