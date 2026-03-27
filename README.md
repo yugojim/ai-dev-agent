@@ -227,5 +227,125 @@ Issue writing rules:
 
 - Rotate any secret that was ever pasted into chat.
 - Keep secrets only in `.env`.
+
+  這是一份非常紮實的 Agent 環境建置清單。為了讓你能在不同作業系統間無縫切換，我將你的步驟整理成 **Windows (PowerShell)**、**macOS (Zsh)** 以及 **Linux (Ubuntu/WSL)** 三種版本。
+
+---
+
+## 💻 跨平台 環境建置對照表
+
+### ✅ Step 0 - 基礎環境安裝
+| 工具 | **Windows (PowerShell)** | **macOS (Homebrew)** | **Linux (Ubuntu)** |
+| :--- | :--- | :--- | :--- |
+| **Python** | [官網下載](https://www.python.org/) | `brew install python` | `sudo apt install python3 python3-venv python3-pip` |
+| **Node.js** | [官網下載](https://nodejs.org/) | `brew install node` | `curl -fsSL https://deb.nodesource.com/...` |
+| **Git** | [官網下載](https://git-scm.com/) | `brew install git` | `sudo apt install git` |
+
+---
+
+### ✅ Step 1 ~ 3 - 初始化 Workspace 與 虛擬環境
+在各平台打開終端機後執行：
+
+* **Windows:**
+    ```powershell
+    mkdir ~/ai-dev-agent; cd ~/ai-dev-agent
+    python -m venv venv
+    .\venv\Scripts\Activate.ps1
+    python -m pip install --upgrade pip wheel setuptools
+    ```
+* **macOS / Linux:**
+    ```zsh
+    mkdir -p ~/ai-dev-agent && cd ~/ai-dev-agent
+    python3 -m venv venv
+    source venv/bin/activate
+    pip install --upgrade pip wheel setuptools
+    ```
+
+---
+
+### ✅ Step 4 ~ 5 - Python 套件與 Playwright
+這部分的 Python 指令在所有平台**完全相同**（需在虛擬環境內）：
+
+```bash
+# 安裝核心套件
+pip install requests python-dotenv rich tenacity playwright pydantic gitpython tqdm pyyaml
+
+# 安裝瀏覽器核心
+playwright install chromium
+```
+> **注意：** macOS 不需要額外安裝中文字型（系統內建）；Windows 若有亂碼請確認系統語言設定；Linux 則必須執行 `sudo apt install` 那些 `libnss3` 等依賴項。
+
+---
+
+### ✅ Step 7 ~ 8 - Codex 與 API Key 設定
+* **Windows (PowerShell):**
+    ```powershell
+    npm install -g @openai/codex
+    # 永久加入環境變數
+    [Environment]::SetEnvironmentVariable("OPENAI_API_KEY", "sk-xxxx", "User")
+    # 需重啟終端機生效
+    ```
+* **macOS / Linux:**
+    ```bash
+    npm install -g @openai/codex
+    echo 'export OPENAI_API_KEY="sk-xxxx"' >> ~/.zshrc # macOS 用 .zshrc, Linux 用 .bashrc
+    source ~/.zshrc
+    ```
+
+---
+
+### ✅ Step 9 - Git SSH 設定
+所有平台指令雷同：
+```bash
+ssh-keygen -t ed25519
+# 查看 Key 並貼到 GitHub
+cat ~/.ssh/id_ed25519.pub  # macOS/Linux
+type $HOME\.ssh\id_ed25519.pub # Windows
+```
+
+---
+
+### ✅ Step 10 - Java & Maven
+這是差異較大的部分：
+
+* **Windows:**
+    * 建議用 `winget` 或手動下載：
+    ```powershell
+    winget install Microsoft.OpenJDK.21
+    winget install Apache.Maven
+    ```
+* **macOS:**
+    ```zsh
+    brew install openjdk@21 maven
+    # 需設定 Java Home 指向 brew 路徑
+    sudo ln -sfn $(brew --prefix)/opt/openjdk@21/libexec/openjdk.jdk /Library/Java/JavaVirtualMachines/openjdk-21.jdk
+    ```
+* **Linux (Ubuntu):**
+    ```bash
+    sudo apt install -y openjdk-21-jdk maven
+    ```
+
+---
+
+### ✅ Step 11 ~ 12 - 執行 Agent
+一旦環境齊備，執行指令在三平台**一致**：
+
+```bash
+# 啟動 Agent
+python agent_loop.py --mode codex_only
+
+# 測試專案編譯 (Maven)
+mvn clean package -DskipTests
+```
+
+---
+
+## 💡 總結建議
+
+1.  **Windows 用戶：** 如果要在 Windows 原生環境跑（非 WSL），強烈建議安裝 [**PowerShell 7**](https://aka.ms/PSWindows) 體驗會更接近 Linux，且 `rm -rf` 等指令會比較好用。
+2.  **macOS 用戶：** 遇到 `xcrun: error` 請記得執行 `xcode-select --install`。
+3.  **環境變數：** Windows 更改環境變數後，VS Code 的內建終端機通常要**完全關掉重開**才會抓到新變數。
+
+
 - Use a dedicated test account.
 - Review commands before running them.
