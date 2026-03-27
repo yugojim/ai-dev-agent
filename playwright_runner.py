@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -46,6 +47,12 @@ def app_host(base_url: str) -> str:
     return urlparse(base_url).netloc
 
 
+class StepExecutionError(RuntimeError):
+    def __init__(self, message: str, results: list[dict]):
+        super().__init__(message)
+        self.results = results
+
+
 def load_issue_context() -> dict | None:
     issue_path = Path.cwd().parent / "task_context" / "issue.json"
     if not issue_path.exists():
@@ -56,22 +63,262 @@ def load_issue_context() -> dict | None:
     except Exception:
         return None
 
-    url = data.get("URL") or data.get("url") or "/"
-    role = data.get("Role") or data.get("role") or ""
-    expected = data.get("Expected") or data.get("expected") or []
-    forbidden = data.get("Forbidden") or data.get("forbidden") or []
+    validation = data.get("validation") or {}
+    url = (
+        validation.get("url")
+        or data.get("URL")
+        or data.get("url")
+        or "/"
+    )
+    role = (
+        validation.get("role")
+        or data.get("Role")
+        or data.get("role")
+        or ""
+    )
+    expected = (
+        validation.get("expected")
+        or data.get("Expected")
+        or data.get("expected")
+        or []
+    )
+    forbidden = (
+        validation.get("forbidden")
+        or data.get("Forbidden")
+        or data.get("forbidden")
+        or []
+    )
+    steps = validation.get("steps") or data.get("steps") or []
 
     if isinstance(expected, str):
         expected = [x.strip() for x in expected.split(",") if x.strip()]
     if isinstance(forbidden, str):
         forbidden = [x.strip() for x in forbidden.split(",") if x.strip()]
+    if isinstance(steps, dict):
+        steps = [steps]
+    if isinstance(steps, str):
+        steps = [{"check": steps}]
 
     return {
         "url": url,
         "role": role,
         "expected": expected,
         "forbidden": forbidden,
+        "steps": steps,
     }
+
+
+def sanitize_filename(name: str) -> str:
+    value = re.sub(r"[^a-zA-Z0-9._-]+", "_", (name or "").strip()).strip("._")
+    return value or "step"
+
+
+def step_action_and_value(step) -> tuple[str, str]:
+    if isinstance(step, dict) and step:
+        key, value = next(iter(step.items()))
+        return str(key).strip().lower(), str(value).strip()
+    if isinstance(step, str):
+        if "=" in step:
+            key, value = step.split("=", 1)
+            return key.strip().lower(), value.strip()
+        return "check", step.strip()
+    return "", ""
+
+
+def parse_target(value: str) -> tuple[str, str]:
+    value = (value or "").strip()
+    if value.startswith("css="):
+        return "css", value[4:].strip()
+    if value.startswith("text="):
+        return "text", value[5:].strip()
+    if value.startswith("role="):
+        return "role", value[5:].strip()
+    if value.startswith("url="):
+        return "url", value[4:].strip()
+    if value.startswith("/") or value.startswith("http://") or value.startswith("https://"):
+        return "url", value
+    return "text", value
+
+
+def click_target(page, kind: str, target: str, base_url: str | None = None) -> None:
+    if kind == "url":
+        if not base_url:
+            raise RuntimeError("base_url required for url navigation")
+        page.goto(build_target_url(base_url, target), wait_until="domcontentloaded", timeout=30000)
+        return
+
+    if kind == "css":
+        page.locator(target).first.click(timeout=10000)
+        return
+
+    if kind == "role":
+        parts = [p.strip() for p in target.split("|") if p.strip()]
+        role_name = parts[0] if parts else "button"
+        accessible_name = parts[1] if len(parts) > 1 else ""
+        page.get_by_role(role_name, name=accessible_name or None).first.click(timeout=10000)
+        return
+
+    text_target = target or ""
+    text_locator = page.get_by_text(text_target, exact=False).first
+    text_locator.click(timeout=10000)
+
+
+def fill_target(page, target: str) -> None:
+    if "=>" in target:
+        locator_text, value = target.split("=>", 1)
+    elif "|" in target:
+        locator_text, value = target.split("|", 1)
+    else:
+        raise RuntimeError("fill step must use `selector=>value` or `selector|value`")
+
+    locator_kind, locator_value = parse_target(locator_text.strip())
+    value = value.strip()
+
+    if locator_kind == "css":
+        page.locator(locator_value).first.fill(value, timeout=10000)
+        return
+
+    if locator_kind == "text":
+        locator = page.get_by_label(locator_value, exact=False).first
+        locator.fill(value, timeout=10000)
+        return
+
+    raise RuntimeError("fill supports css= or label text targets only")
+
+
+def wait_for_target(page, target: str) -> None:
+    value = (target or "").strip()
+    if not value:
+        page.wait_for_timeout(1000)
+        return
+    if value.isdigit():
+        page.wait_for_timeout(int(value))
+        return
+
+    kind, normalized = parse_target(value)
+    if kind == "css":
+        page.locator(normalized).first.wait_for(state="visible", timeout=10000)
+        return
+
+    if kind == "text":
+        page.get_by_text(normalized, exact=False).first.wait_for(state="visible", timeout=10000)
+        return
+
+    if kind == "url":
+        page.wait_for_url(lambda current_url: normalized in current_url, timeout=15000)
+        return
+
+    if kind == "role":
+        parts = [p.strip() for p in normalized.split("|") if p.strip()]
+        role_name = parts[0] if parts else "button"
+        accessible_name = parts[1] if len(parts) > 1 else ""
+        page.get_by_role(role_name, name=accessible_name or None).first.wait_for(
+            state="visible",
+            timeout=10000,
+        )
+        return
+
+
+def check_target(page, target: str) -> str:
+    kind, normalized = parse_target(target)
+
+    if kind == "css":
+        locator = page.locator(normalized).first
+        locator.wait_for(state="visible", timeout=10000)
+        return f"visible selector: {normalized}"
+
+    if kind == "url":
+        if normalized not in page.url:
+            raise RuntimeError(f"url does not contain `{normalized}`")
+        return f"url contains: {normalized}"
+
+    if kind == "role":
+        parts = [p.strip() for p in normalized.split("|") if p.strip()]
+        role_name = parts[0] if parts else "button"
+        accessible_name = parts[1] if len(parts) > 1 else ""
+        page.get_by_role(role_name, name=accessible_name or None).first.wait_for(
+            state="visible",
+            timeout=10000,
+        )
+        return f"visible role: {normalized}"
+
+    locator = page.get_by_text(normalized, exact=False).first
+    locator.wait_for(state="visible", timeout=10000)
+    return f"visible text: {normalized}"
+
+
+def capture_step_screenshot(page, output_dir: Path, index: int, action: str) -> str:
+    filename = f"step_{index:02d}_{sanitize_filename(action)}.png"
+    path = output_dir / filename
+    page.screenshot(path=str(path), full_page=True)
+    return str(path)
+
+
+def execute_steps(page, base_url: str, steps: list, output_dir: Path) -> list[dict]:
+    results: list[dict] = []
+
+    for index, step in enumerate(steps, start=1):
+        action, value = step_action_and_value(step)
+        record = {
+            "index": index,
+            "action": action,
+            "target": value,
+            "passed": False,
+            "detail": "",
+            "screenshot": "",
+        }
+        if not action:
+            record["detail"] = "empty step"
+            results.append(record)
+            continue
+
+        try:
+            print(f"[flow] step {index}: {action}={value}")
+
+            if action == "open":
+                target_kind, target_value = parse_target(value)
+                click_target(page, target_kind, target_value, base_url=base_url)
+                page.wait_for_timeout(1500)
+            elif action == "click":
+                target_kind, target_value = parse_target(value)
+                click_target(page, target_kind, target_value, base_url=base_url)
+                page.wait_for_timeout(1200)
+            elif action == "fill":
+                fill_target(page, value)
+            elif action == "wait":
+                wait_for_target(page, value)
+            elif action == "check":
+                record["detail"] = check_target(page, value)
+            elif action == "screenshot":
+                record["detail"] = "manual screenshot step"
+            else:
+                raise RuntimeError(f"unsupported step action: {action}")
+
+            try_close_optional_dialogs(page)
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except PlaywrightTimeoutError:
+                pass
+
+            if not record["detail"]:
+                record["detail"] = "ok"
+            record["passed"] = True
+            record["screenshot"] = capture_step_screenshot(page, output_dir, index, action)
+        except Exception as exc:
+            record["detail"] = str(exc)
+            try:
+                record["screenshot"] = capture_step_screenshot(page, output_dir, index, f"{action}_failed")
+            except Exception:
+                pass
+            results.append(record)
+            raise StepExecutionError(
+                f"step {index} failed: {action}={value} ({exc})",
+                results,
+            ) from exc
+
+        results.append(record)
+
+    return results
 
 
 def first_visible_selector(page, selectors: list[str], timeout: int = 2500) -> str | None:
@@ -399,24 +646,32 @@ def main():
     issue_ctx = load_issue_context()
     if issue_ctx:
         target_path = issue_ctx["url"]
+        role = issue_ctx["role"]
         expected_texts = issue_ctx["expected"]
         forbidden_texts = issue_ctx["forbidden"]
+        steps = issue_ctx["steps"]
     else:
         target_path = "/"
+        role = ""
         expected_texts = []
         forbidden_texts = []
+        steps = []
 
     target_url = build_target_url(base_url, target_path)
 
     result = {
         "passed": False,
         "summary": "",
+        "role": role,
         "expected": ", ".join(expected_texts) if expected_texts else "",
         "actual": "",
         "target_url": target_url,
         "final_url": "",
         "screenshot": str(output_dir / "screenshot.png"),
         "console_log": str(output_dir / "console.log"),
+        "steps": steps,
+        "step_results": [],
+        "step_screenshots": [],
     }
 
     console_lines = []
@@ -454,6 +709,20 @@ def main():
 
             try_close_optional_dialogs(page)
 
+            if steps:
+                try:
+                    step_results = execute_steps(page, base_url, steps, output_dir)
+                    result["step_results"] = step_results
+                    result["step_screenshots"] = [
+                        item["screenshot"] for item in step_results if item.get("screenshot")
+                    ]
+                except StepExecutionError as step_exc:
+                    result["step_results"] = step_exc.results
+                    result["step_screenshots"] = [
+                        item["screenshot"] for item in step_exc.results if item.get("screenshot")
+                    ]
+                    raise
+
             result["final_url"] = page.url
 
             ok, summary, actual = validate_page(page, expected_texts, forbidden_texts)
@@ -472,7 +741,7 @@ def main():
             browser.close()
 
     except Exception as e:
-        result["summary"] = "Playwright execution failed"
+        result["summary"] = str(e) or "Playwright execution failed"
         result["actual"] = str(e)
 
     result["font_check_passed"] = font_ok

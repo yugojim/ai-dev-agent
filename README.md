@@ -147,7 +147,7 @@ The loop currently performs this flow:
 8. Run build validation.
 9. Start the app locally.
 10. Wait for health checks on `http://localhost:<APP_PORT>`.
-11. Run Playwright capture and save runtime artifacts.
+11. Run Playwright capture, execute `validation.steps`, and save runtime artifacts.
 12. If checks pass, commit, rebase, and push.
 13. Upload the report back to Redmine.
 
@@ -218,6 +218,9 @@ Forbidden: 備註
 Issue writing rules:
 
 - 每個需求都要能直接轉成程式修改，不要只寫「如附件」
+- UI 驗證請盡量提供 `Role` 與 `[Steps]`，讓 Codex / Playwright 可以自動從登入後一路導航到目標頁
+- `Steps` 建議使用單一步驟單一動作格式，例如 `open=/feature/list`、`click=text=查詢`、`click=css=.menu-item`、`wait=2000`、`check=text=結果清單`
+- Codex 在實作完成後可視需要補強 `task_context/issue.json` 的 `validation.steps`，讓 Playwright 報告顯示實際測試角色、流程與逐步截圖
 - 每個畫面都要分開列出，避免模型自行推論影響範圍
 - `Expected` / `Forbidden` 要填可比對的字串
 - `Steps` 要描述真實操作，不要只寫「進入頁面後確認」

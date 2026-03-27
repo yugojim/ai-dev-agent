@@ -215,7 +215,27 @@ def write_md(path: str | Path, report_data: dict):
         lines.append(f"- 執行記錄: {runtime.get('runtime_log', '')}")
         lines.append(f"- 截圖: {runtime.get('screenshot', '')}")
         lines.append(f"- Console Log: {runtime.get('console_log', '')}")
+        lines.append(f"- 測試角色: {runtime.get('role', '')}")
+        lines.append(f"- 目標頁面: {runtime.get('target_url', '')}")
+        lines.append(f"- 最終頁面: {runtime.get('final_url', '')}")
         lines.append(f"- 摘要: {runtime.get('summary', '')}")
+        runtime_steps = runtime.get("steps", []) or []
+        if runtime_steps:
+            lines.append("")
+            lines.append("#### 測試流程")
+            lines.append("")
+            for step in runtime_steps:
+                lines.append(f"- {json.dumps(step, ensure_ascii=False)}")
+        step_results = runtime.get("step_results", []) or []
+        if step_results:
+            lines.append("")
+            lines.append("#### 測試流程結果")
+            lines.append("")
+            for step in step_results:
+                lines.append(
+                    f"- Step {step.get('index', '')}: {step.get('action', '')} {step.get('target', '')} | "
+                    f"passed={step.get('passed', '')} | detail={step.get('detail', '')} | screenshot={step.get('screenshot', '')}"
+                )
         if runtime.get("log_tail"):
             lines.append("")
             lines.append("```text")
@@ -296,8 +316,8 @@ def build_prompt_from_issue(issue: dict) -> str:
         attachment_lines.append("- No attachments downloaded.")
 
     return f"""Please read these files first:
-- task_context/issue.json
-- task_context/prompt.txt
+- ../task_context/issue.json
+- ../task_context/prompt.txt
 
 Task:
 Implement Redmine issue #{issue["issue_id"]}.
@@ -327,6 +347,8 @@ Rules:
 4. Do not commit or push anything.
 5. After editing, summarize modified files and suggested verification commands.
 6. Do not start long-running servers unless necessary.
+7. If UI verification requires login, menu navigation, or role-specific entry points, update `../task_context/issue.json` `validation` fields so Playwright can execute the flow.
+8. Keep `validation.steps` as a JSON array of single-key objects such as `{{"open": "/feature"}}`, `{{"click": "text=查詢"}}`, `{{"check": "text=結果清單"}}`.
 
 CRITICAL EXECUTION RULES:
 
@@ -885,6 +907,12 @@ def run_runtime_phase(workspace_dir: Path) -> dict:
             "runtime_log": runtime_log_report_path,
             "project_type": start_result.get("project_type", ""),
             "command": start_result.get("command", ""),
+            "role": playwright_result.get("role", ""),
+            "target_url": playwright_result.get("target_url", ""),
+            "final_url": playwright_result.get("final_url", ""),
+            "steps": playwright_result.get("steps", []),
+            "step_results": playwright_result.get("step_results", []),
+            "step_screenshots": playwright_result.get("step_screenshots", []),
             "screenshot": playwright_result.get("screenshot", ""),
             "console_log": playwright_result.get("console_log", ""),
             "expected": playwright_result.get("expected", ""),
