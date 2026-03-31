@@ -140,7 +140,7 @@ The loop currently performs this flow:
 1. Fetch one issue from Redmine.
 2. Refresh the full issue detail and download attachments.
 3. Create `issue-<id>` workspace folders.
-4. Write `task_context/issue.json` and `task_context/prompt.txt`.
+4. Parse the issue and optionally let Codex rewrite it into a stricter implementation brief, then write `task_context/issue.json` and `task_context/prompt.txt`.
 5. Clone the repository into `workspace/repo`.
 6. Create or switch to `feat/<issue_id>`.
 7. Run Codex CLI against the generated prompt.
@@ -166,6 +166,17 @@ The runtime flow is now designed for both macOS and Windows:
 codex --help
 codex exec -m gpt-5.4 -s danger-full-access -C /path/to/repo "Fix the Redmine issue in task_context/prompt.txt"
 ```
+
+Ticket-rewrite mode is enabled by default:
+
+```bash
+export CODEX_PREPARE_TICKET=true
+python agent_loop.py
+```
+
+Set `CODEX_PREPARE_TICKET=false` to disable it.
+
+The agent first sends the raw Redmine issue through Codex in read-only mode and uses the returned JSON to enrich `task_context/issue.json` and `task_context/prompt.txt`. If the rewrite fails, returns invalid JSON, or produces weak output such as empty requirements and unusable validation, the original parser output is kept. Any ambiguity is written into `rewrite_warnings` so the implementation phase can stay conservative.
 
 ## 9. Recommended Redmine issue format
 

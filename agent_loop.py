@@ -23,6 +23,7 @@ from scripts.redmine_tool import (
     get_first_low_priority_issue,
     get_issue_detail,
 )
+from scripts.task_context_builder import build_context_issue, build_prompt_from_issue
 from scripts.workspace import get_issue_branch
 
 load_dotenv()
@@ -280,87 +281,6 @@ def write_md(path: str | Path, report_data: dict):
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
-def build_prompt_from_issue(issue: dict) -> str:
-    subject = issue.get("summary", "") or issue.get("subject", "")
-    raw = issue.get("raw", {})
-    description = raw.get("description", "")
-    requirements = issue.get("requirements", []) or []
-    validation = issue.get("validation", {}) or {}
-    attachment_files = issue.get("downloaded_attachments", []) or []
-    raw_attachments = raw.get("attachments", []) or []
-
-    requirement_lines = "\n".join(f"- {item}" for item in requirements) if requirements else "- No structured requirements were parsed from the Redmine description."
-    validation_lines = "\n".join(
-        [
-            f"- URL: {validation.get('url', '/')}",
-            f"- Role: {validation.get('role', '') or '(not specified)'}",
-            f"- Expected: {', '.join(validation.get('expected', [])) or '(none)'}",
-            f"- Forbidden: {', '.join(validation.get('forbidden', [])) or '(none)'}",
-        ]
-    )
-    steps = validation.get("steps", []) or []
-    step_lines = (
-        "\n".join(f"- {json.dumps(step, ensure_ascii=False)}" for step in steps)
-        if steps
-        else "- No structured steps were parsed from the Redmine description."
-    )
-    attachment_lines = []
-    for path in attachment_files:
-        attachment_lines.append(f"- {path}")
-    if not attachment_lines:
-        for attachment in raw_attachments:
-            filename = attachment.get("filename", "")
-            if filename:
-                attachment_lines.append(f"- attachments/{filename} (referenced by Redmine, may require download)")
-    if not attachment_lines:
-        attachment_lines.append("- No attachments downloaded.")
-
-    return f"""Please read these files first:
-- ../task_context/issue.json
-- ../task_context/prompt.txt
-
-Task:
-Implement Redmine issue #{issue["issue_id"]}.
-
-Issue subject:
-{subject}
-
-Issue description:
-{description}
-
-Structured requirements:
-{requirement_lines}
-
-Validation targets:
-{validation_lines}
-
-Validation steps:
-{step_lines}
-
-Available attachments:
-{chr(10).join(attachment_lines)}
-
-Rules:
-1. Keep changes minimal and limited to this ticket.
-2. Before editing, identify relevant files and logic.
-3. Then apply the patch in the repo.
-4. Do not commit or push anything.
-5. After editing, summarize modified files and suggested verification commands.
-6. Do not start long-running servers unless necessary.
-7. If UI verification requires login, menu navigation, or role-specific entry points, update `../task_context/issue.json` `validation` fields so Playwright can execute the flow.
-8. Keep `validation.steps` as a JSON array of single-key objects such as `{{"open": "/feature"}}`, `{{"click": "text=查詢"}}`, `{{"check": "text=結果清單"}}`.
-
-CRITICAL EXECUTION RULES:
-
-You MUST apply the change by editing real files in the repository.
-Do not stop after analysis.
-Do not only describe the change.
-Do not propose pseudo-code.
-You must actually write and apply the patch.
-If no file is modified, the task will be considered FAILED.
-""".strip()
-
-
 def prepare_attachments(issue_id: str, workspace_dir: Path) -> list[str]:
     attachments_dir = workspace_dir / "attachments"
     downloaded = download_issue_attachments(issue_id, attachments_dir)
@@ -380,6 +300,7 @@ def prepare_workspace(issue_id: str) -> Path:
 
 
 def prepare_task_context(issue: dict, workspace_dir: Path):
+    issue = build_context_issue(issue)
     issue_json_path = workspace_dir / "task_context" / "issue.json"
     prompt_txt_path = workspace_dir / "task_context" / "prompt.txt"
 

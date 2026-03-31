@@ -17,6 +17,10 @@ DEFAULT_WORKSPACE_ROOT = resolve_workspace_base_dir(os.environ.get("WORKSPACE_BA
 DEFAULT_NEW_BRANCH = date.today().isoformat()
 
 
+class MergeConflictError(RuntimeError):
+    pass
+
+
 def get_issue_branch(issue_no: int | str) -> str:
     return f"feat/{issue_no}"
 
@@ -107,10 +111,26 @@ def prepare_output_repo(output_repo: Path, origin: str, base_branch: str, new_br
 
 def merge_branch_into_output(output_repo: Path, source_repo: Path, branch: str) -> None:
     run_git(["fetch", str(source_repo), branch], output_repo)
-    run_git(
+    merge_proc = run_git(
         ["merge", "--no-ff", "--no-edit", "FETCH_HEAD"],
         output_repo,
+        check=False,
     )
+    if merge_proc.returncode == 0:
+        return
+
+    conflict_check = run_git(
+        ["diff", "--name-only", "--diff-filter=U"],
+        output_repo,
+        check=False,
+    )
+    conflicted_files = [line.strip() for line in (conflict_check.stdout or "").splitlines() if line.strip()]
+    if conflicted_files:
+        run_git(["merge", "--abort"], output_repo, check=False)
+        files = ", ".join(conflicted_files)
+        raise MergeConflictError(f"merge conflict detected: {files}")
+
+    raise RuntimeError(merge_proc.stderr or merge_proc.stdout or "git merge failed")
 
 
 def collect_sources(workspace_root: Path, branch_mode: str) -> list[tuple[str, Path, str]]:
@@ -210,14 +230,21 @@ def main() -> None:
     print(f"[merge] output repo: {output_repo}")
     prepare_output_repo(output_repo, first_origin, args.base_branch, args.new_branch, args.force)
 
+    merged: list[str] = []
+    conflicts: list[str] = []
+    failed: list[str] = []
+
     for issue_no, repo_dir, branch in sources:
         print(f"[merge] merging issue-{issue_no} branch {branch}")
         try:
             merge_branch_into_output(output_repo, repo_dir, branch)
-        except Exception as exc:
-            print(f"[merge] merge stopped at issue-{issue_no} branch {branch}: {exc}")
-            print(f"[merge] resolve conflicts in: {output_repo}")
-            raise
+            merged.append(f"issue-{issue_no}: {branch}")
+        except MergeConflictError as exc:
+            print(f"[merge] skipped issue-{issue_no} branch {branch} due to conflict: {exc}")
+            conflicts.append(f"issue-{issue_no}: {branch} ({exc})")
+        except RuntimeError as exc:
+            print(f"[merge] skipped issue-{issue_no} branch {branch} due to error: {exc}")
+            failed.append(f"issue-{issue_no}: {branch} ({exc})")
 
     if args.push:
         run_git(["push", "-u", "origin", args.new_branch], output_repo)
@@ -225,6 +252,16 @@ def main() -> None:
     print("[merge] completed")
     print(f"[merge] integration repo: {output_repo}")
     print(f"[merge] integration branch: {args.new_branch}")
+    print("[merge] summary:")
+    print(f"- merged: {len(merged)}")
+    for item in merged:
+        print(f"  - {item}")
+    print(f"- conflicts skipped: {len(conflicts)}")
+    for item in conflicts:
+        print(f"  - {item}")
+    print(f"- failed skipped: {len(failed)}")
+    for item in failed:
+        print(f"  - {item}")
 
 
 if __name__ == "__main__":

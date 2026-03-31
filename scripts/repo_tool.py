@@ -10,6 +10,7 @@ from scripts.redmine_tool import (
     get_first_low_priority_issue,
     get_issue_detail,
 )
+from scripts.task_context_builder import build_context_issue
 from scripts.workspace import get_issue_branch, get_issue_workspace
 
 
@@ -60,6 +61,7 @@ def get_task_context_dir(issue_no: int | str) -> Path:
 def write_issue_json(issue_no: int | str, issue_detail: dict) -> Path:
     task_context_dir = ensure_dir(get_task_context_dir(issue_no))
     output = task_context_dir / "issue.json"
+    issue_detail = build_context_issue(issue_detail)
     output.write_text(
         json.dumps(issue_detail, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -71,14 +73,20 @@ def write_prompt_txt(issue_no: int | str, issue_detail: dict) -> Path:
     task_context_dir = ensure_dir(get_task_context_dir(issue_no))
     attachments_dir = get_attachments_dir(issue_no)
     repo_dir = get_repo_dir(issue_no)
+    issue_detail = build_context_issue(issue_detail)
 
-    issue_id = issue_detail.get("id")
-    subject = issue_detail.get("subject", "")
-    description = issue_detail.get("description", "") or ""
-    project = (issue_detail.get("project") or {}).get("name", "")
-    priority = (issue_detail.get("priority") or {}).get("name", "")
-    status = (issue_detail.get("status") or {}).get("name", "")
-    attachments = issue_detail.get("attachments", [])
+    raw = issue_detail.get("raw", {}) or issue_detail
+    issue_id = issue_detail.get("id") or raw.get("id")
+    subject = issue_detail.get("summary", "") or raw.get("subject", "")
+    description = raw.get("description", "") or ""
+    project = (raw.get("project") or {}).get("name", "")
+    priority = (raw.get("priority") or {}).get("name", "")
+    status = (raw.get("status") or {}).get("name", "")
+    attachments = raw.get("attachments", [])
+    requirements = issue_detail.get("requirements", []) or []
+    validation = issue_detail.get("validation", {}) or {}
+    prompt_focus = issue_detail.get("prompt_focus", []) or []
+    rewrite_warnings = issue_detail.get("rewrite_warnings", []) or []
 
     attachment_lines = []
     for att in attachments:
@@ -96,6 +104,23 @@ Status: {status}
 
 Description:
 {description}
+
+Requirements:
+{chr(10).join(f"- {item}" for item in requirements) if requirements else "- (no structured requirements)"}
+
+Validation:
+- URL: {validation.get("url", "/")}
+- Role: {validation.get("role", "") or "(not specified)"}
+- Expected: {", ".join(validation.get("expected", [])) or "(none)"}
+- Forbidden: {", ".join(validation.get("forbidden", [])) or "(none)"}
+- Steps:
+{chr(10).join(f"  - {json.dumps(step, ensure_ascii=False)}" for step in validation.get("steps", []) or []) if validation.get("steps") else "  - (no structured steps)"}
+
+Implementation Focus:
+{chr(10).join(f"- {item}" for item in prompt_focus) if prompt_focus else "- (none)"}
+
+Rewrite Warnings:
+{chr(10).join(f"- {item}" for item in rewrite_warnings) if rewrite_warnings else "- (none)"}
 
 Workspace:
 - Repo: {repo_dir}
@@ -171,7 +196,7 @@ def prepare_next_issue():
     else:
         run_git(["checkout", "-b", branch_name], repo_dir)
 
-    issue_detail = get_issue_detail(issue_no)
+    issue_detail = build_context_issue(get_issue_detail(issue_no))
     downloaded_files = download_issue_attachments(issue_no, attachments_dir)
     issue_json_path = write_issue_json(issue_no, issue_detail)
     prompt_path = write_prompt_txt(issue_no, issue_detail)
