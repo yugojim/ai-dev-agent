@@ -133,6 +133,34 @@ python scripts/repo_tool.py finalize-issue 12345
 python agent_loop.py
 ```
 
+### Run Playwright with `testplan.txt`
+
+```bash
+python playwright_runner.py http://localhost:8080 ./report
+```
+
+`playwright_runner.py` can be run independently and accepts:
+
+```bash
+python playwright_runner.py <base_url> <output_dir> [storage_state]
+```
+
+Examples:
+
+```bash
+python playwright_runner.py http://localhost:8080 ./report
+python playwright_runner.py http://localhost:8080 ./report ./runtime/storage_state.json
+TEST_USERNAME=myuser TEST_PASSWORD=mypassword python playwright_runner.py http://localhost:8080 ./report
+```
+
+Behavior:
+
+- It prefers `testplan.txt` in the current directory.
+- If `testplan.txt` does not exist, it falls back to `task_context/issue.json`.
+- If `storage_state` is provided, it tries to reuse that authenticated session first.
+- If `storage_state` is missing or invalid, it will try to log in with `TEST_USERNAME` and `TEST_PASSWORD`.
+- It writes `result.json`, `console.log`, a final `screenshot.png`, and per-step screenshots into the output directory.
+
 ## 6. What `agent_loop.py` does
 
 The loop currently performs this flow:
@@ -147,7 +175,7 @@ The loop currently performs this flow:
 8. Run build validation.
 9. Start the app locally.
 10. Wait for health checks on `http://localhost:<APP_PORT>`.
-11. Run Playwright capture, execute `validation.steps`, and save runtime artifacts.
+11. Run Playwright capture, execute steps from `testplan.txt` or `validation.steps`, and save runtime artifacts.
 12. If checks pass, commit, rebase, and push.
 13. Upload the report back to Redmine.
 
@@ -231,6 +259,7 @@ Issue writing rules:
 - 每個需求都要能直接轉成程式修改，不要只寫「如附件」
 - UI 驗證請盡量提供 `Role` 與 `[Steps]`，讓 Codex / Playwright 可以自動從登入後一路導航到目標頁
 - `Steps` 建議使用單一步驟單一動作格式，例如 `open=/feature/list`、`click=text=查詢`、`click=css=.menu-item`、`wait=2000`、`check=text=結果清單`
+- 若你想手動維護 Playwright 測試流程，可直接編輯專案根目錄的 `testplan.txt`；格式與 `Steps` 相同，並可額外加入 `Expected:` / `Forbidden:` 驗證文字
 - Codex 在實作完成後可視需要補強 `task_context/issue.json` 的 `validation.steps`，讓 Playwright 報告顯示實際測試角色、流程與逐步截圖
 - 每個畫面都要分開列出，避免模型自行推論影響範圍
 - `Expected` / `Forbidden` 要填可比對的字串

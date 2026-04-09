@@ -1,0 +1,48 @@
+# Playwright test plan
+# `playwright_runner.py` 會優先讀這個檔案。
+# 若此檔不存在，才會退回讀取 `task_context/issue.json` 的 validation 設定。
+
+URL: /
+Role: reviewer
+Expected:
+- 說明
+Forbidden:
+- 備註
+Steps:
+1. open=新案申請書
+2. check=附件欄位標題顯示「說明」
+3. open=PI回覆
+4. check=附件欄位標題顯示「說明」
+
+Guide:
+# 如何增加測試流程
+# 1. 直接在 `Steps:` 區塊往下新增一行即可。
+# 2. 每一行格式是 `動作=目標`，可寫成 `click=text=查詢` 這種形式。
+# 3. `Expected:` / `Forbidden:` 可放最終頁面要驗證的文字，可一行一個，也可逗號分隔。
+#
+# 目前支援的動作
+# - `open=/path`
+#   直接開啟頁面，也可以寫完整網址，或文字/role/css 導航目標。
+# - `click=text=按鈕文字`
+# - `click=css=.menu-item`
+# - `click=role=button|送出`
+# - `fill=css=input[name="keyword"]=>ABC`
+# - `fill=關鍵字|ABC`
+#   `fill` 支援 `selector=>value` 或 `label|value`
+# - `wait=2000`
+#   等待 2000 毫秒
+# - `wait=text=查詢結果`
+# - `wait=css=.result-table`
+# - `wait=url=/feature/list`
+# - `check=text=查詢結果`
+# - `check=css=.result-table`
+# - `check=role=heading|案件列表`
+# - `check=url=/feature/list`
+# - `screenshot=搜尋結果頁`
+#
+# 範例：新增查詢流程
+# 5. click=text=案件查詢
+# 6. fill=案件編號|A12345
+# 7. click=role=button|查詢
+# 8. wait=text=查詢結果
+# 9. check=text=A12345

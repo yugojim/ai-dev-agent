@@ -9,6 +9,8 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
+SUPPORTED_STEP_ACTIONS = {"open", "click", "fill", "wait", "check", "screenshot"}
+
 
 def is_cognito_url(url: str) -> bool:
     url = (url or "").lower()
@@ -51,6 +53,94 @@ class StepExecutionError(RuntimeError):
     def __init__(self, message: str, results: list[dict]):
         super().__init__(message)
         self.results = results
+
+
+def parse_list_items(raw_value: str) -> list[str]:
+    return [item.strip() for item in (raw_value or "").split(",") if item.strip()]
+
+
+def parse_testplan_step_line(line: str):
+    text = (line or "").strip()
+    if not text or text.startswith("#"):
+        return None
+
+    text = re.sub(r"^\d+\.\s*", "", text)
+    text = re.sub(r"^-\s*", "", text)
+    if not text or "=" not in text:
+        return None
+
+    action, value = text.split("=", 1)
+    action = action.strip().lower()
+    value = value.strip()
+
+    if action not in SUPPORTED_STEP_ACTIONS or not value:
+        return None
+
+    return {action: value}
+
+
+def load_test_plan(plan_path: Path) -> dict | None:
+    if not plan_path.exists():
+        return None
+
+    text = plan_path.read_text(encoding="utf-8")
+    result = {
+        "url": "/",
+        "role": "",
+        "expected": [],
+        "forbidden": [],
+        "steps": [],
+        "source": str(plan_path),
+    }
+
+    current_section = ""
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        header_match = re.match(r"^(URL|Role|Expected|Forbidden|Steps|Guide)\s*:\s*(.*)$", line, re.IGNORECASE)
+        if header_match:
+            key = header_match.group(1).lower()
+            value = header_match.group(2).strip()
+
+            if key == "url":
+                if value:
+                    result["url"] = value
+                current_section = ""
+                continue
+            if key == "role":
+                result["role"] = value
+                current_section = ""
+                continue
+            if key in {"expected", "forbidden"}:
+                if value:
+                    result[key] = parse_list_items(value)
+                    current_section = ""
+                else:
+                    current_section = key
+                continue
+            if key == "steps":
+                current_section = "steps"
+                step = parse_testplan_step_line(value)
+                if step:
+                    result["steps"].append(step)
+                continue
+            current_section = "guide"
+            continue
+
+        if current_section in {"expected", "forbidden"}:
+            item = re.sub(r"^-\s*", "", line).strip()
+            if item:
+                result[current_section].append(item)
+            continue
+
+        if current_section == "steps":
+            step = parse_testplan_step_line(line)
+            if step:
+                result["steps"].append(step)
+
+    return result
 
 
 def load_issue_context() -> dict | None:
@@ -643,13 +733,22 @@ def main():
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    testplan_path = Path(
+        os.environ.get("PLAYWRIGHT_TESTPLAN_PATH", "testplan.txt")
+    ).expanduser()
+    if not testplan_path.is_absolute():
+        testplan_path = Path.cwd() / testplan_path
+
+    testplan_ctx = load_test_plan(testplan_path)
     issue_ctx = load_issue_context()
-    if issue_ctx:
-        target_path = issue_ctx["url"]
-        role = issue_ctx["role"]
-        expected_texts = issue_ctx["expected"]
-        forbidden_texts = issue_ctx["forbidden"]
-        steps = issue_ctx["steps"]
+    config_ctx = testplan_ctx or issue_ctx
+
+    if config_ctx:
+        target_path = config_ctx["url"]
+        role = config_ctx["role"]
+        expected_texts = config_ctx["expected"]
+        forbidden_texts = config_ctx["forbidden"]
+        steps = config_ctx["steps"]
     else:
         target_path = "/"
         role = ""
@@ -672,6 +771,8 @@ def main():
         "steps": steps,
         "step_results": [],
         "step_screenshots": [],
+        "testplan_path": str(testplan_path) if testplan_ctx else "",
+        "config_source": "testplan.txt" if testplan_ctx else ("issue.json" if issue_ctx else ""),
     }
 
     console_lines = []
