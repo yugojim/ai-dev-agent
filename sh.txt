@@ -146,3 +146,16 @@ Optional 更穩
 sudo apt install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 \
 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2
+
+OPENAI_API_KEY=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
+
+REDMINE_BASE_URL="https://redmine.cims.tw"
+REDMINE_API_KEY="100229a6460f111bc4e3b184875f13373d449e7f"
+REPO_URL="https://github.com/panmed/ptms-neo-internal"
+REPO_SSH_URL="git@github.com:panmed/ptms-neo-internal.git"
+REDMINE_VERIFY_SSL="false"
+export REDMINE_TIMEOUT="60"
+
+WORKSPACE_BASE_DIR=/home/gojim/ai-workspaces
+TEST_USERNAME=gojim
+TEST_PASSWORD=!Gojim6886
