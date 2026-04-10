@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-SUPPORTED_STEP_ACTIONS = {"open", "click", "fill", "wait", "check", "screenshot"}
+SUPPORTED_STEP_ACTIONS = {"open", "click", "fill", "upload", "wait", "check", "screenshot"}
 
 
 def is_cognito_url(url: str) -> bool:
@@ -276,6 +276,36 @@ def fill_target(page, target: str) -> None:
     raise RuntimeError("fill supports css= or label text targets only")
 
 
+def upload_target(page, target: str) -> None:
+    if "=>" in target:
+        locator_text, file_path = target.split("=>", 1)
+    elif "|" in target:
+        locator_text, file_path = target.split("|", 1)
+    else:
+        raise RuntimeError("upload step must use `selector=>file_path` or `selector|file_path`")
+
+    locator_kind, locator_value = parse_target(locator_text.strip())
+    upload_path = Path(file_path.strip()).expanduser()
+    if not upload_path.is_absolute():
+        upload_path = (Path.cwd() / upload_path).resolve()
+
+    if not upload_path.exists():
+        raise RuntimeError(f"upload file not found: {upload_path}")
+
+    if locator_kind == "css":
+        page.locator(locator_value).first.set_input_files(str(upload_path), timeout=10000)
+        return
+
+    if locator_kind == "text":
+        page.get_by_label(locator_value, exact=False).first.set_input_files(
+            str(upload_path),
+            timeout=10000,
+        )
+        return
+
+    raise RuntimeError("upload supports css= or label text targets only")
+
+
 def wait_for_target(page, target: str) -> None:
     value = (target or "").strip()
     if not value:
@@ -375,6 +405,8 @@ def execute_steps(page, base_url: str, steps: list, output_dir: Path) -> list[di
                 page.wait_for_timeout(1200)
             elif action == "fill":
                 fill_target(page, value)
+            elif action == "upload":
+                upload_target(page, value)
             elif action == "wait":
                 wait_for_target(page, value)
             elif action == "check":
@@ -660,11 +692,13 @@ def ensure_authenticated_context(browser, base_url: str, storage_state_path: str
 
     username = (
         os.environ.get("TEST_USERNAME", "").strip()
+        or os.environ.get("PLAYWRIGHT_TEST_LOGIN_USERNAME", "").strip()
         or os.environ.get("PLAYWRIGHT_USERNAME", "").strip()
         or os.environ.get("COGNITO_USERNAME", "").strip()
     )
     password = (
         os.environ.get("TEST_PASSWORD", "").strip()
+        or os.environ.get("PLAYWRIGHT_TEST_LOGIN_PASSWORD", "").strip()
         or os.environ.get("PLAYWRIGHT_PASSWORD", "").strip()
         or os.environ.get("COGNITO_PASSWORD", "").strip()
     )

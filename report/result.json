@@ -1,0 +1,273 @@
+{
+  "passed": false,
+  "summary": "step 17 failed: check=text=MedAIRA Ethics Demo Application 98 (Locator.wait_for: Timeout 10000ms exceeded.\nCall log:\n  - waiting for get_by_text(\"MedAIRA Ethics Demo Application 98\").first to be visible\n)",
+  "role": "reviewer",
+  "expected": "申請案營運主控台, 倫理審查工作區",
+  "actual": "step 17 failed: check=text=MedAIRA Ethics Demo Application 98 (Locator.wait_for: Timeout 10000ms exceeded.\nCall log:\n  - waiting for get_by_text(\"MedAIRA Ethics Demo Application 98\").first to be visible\n)",
+  "target_url": "http://localhost:5173/",
+  "final_url": "",
+  "screenshot": "report/screenshot.png",
+  "console_log": "report/console.log",
+  "steps": [
+    {
+      "open": "/"
+    },
+    {
+      "check": "text=申請案營運主控台"
+    },
+    {
+      "check": "text=申請案收件看板"
+    },
+    {
+      "screenshot": "01-申請案營運主控台_申請案列表"
+    },
+    {
+      "click": "text=查看詳情"
+    },
+    {
+      "wait": "url=/ethics/applications/"
+    },
+    {
+      "check": "text=MedAIRA Ethics Demo Application 100"
+    },
+    {
+      "check": "text=申請案概況"
+    },
+    {
+      "screenshot": "02-申請案詳情_MedAIRA_Ethics_Demo_Application_100"
+    },
+    {
+      "click": "text=全域角色"
+    },
+    {
+      "wait": "url=/roles"
+    },
+    {
+      "check": "text=全域角色"
+    },
+    {
+      "screenshot": "03-全域角色_roles"
+    },
+    {
+      "open": "/ethics/applications"
+    },
+    {
+      "click": "text=查看詳情"
+    },
+    {
+      "wait": "url=/ethics/applications/"
+    },
+    {
+      "check": "text=MedAIRA Ethics Demo Application 98"
+    },
+    {
+      "screenshot": "04-申請案詳情_MedAIRA_Ethics_Demo_Application_98"
+    },
+    {
+      "click": "text=平台設定"
+    },
+    {
+      "wait": "url=/config"
+    },
+    {
+      "check": "text=平台設定"
+    },
+    {
+      "screenshot": "05-平台設定_config"
+    },
+    {
+      "open": "/ethics/applications"
+    },
+    {
+      "check": "text=申請案清單"
+    },
+    {
+      "screenshot": "06-申請案列表_ethics_applications"
+    },
+    {
+      "click": "text=生物樣本庫"
+    },
+    {
+      "wait": "url=/biobank"
+    },
+    {
+      "check": "text=生物樣本庫"
+    },
+    {
+      "screenshot": "07-生物樣本庫_biobank"
+    },
+    {
+      "click": "text=營運管理"
+    },
+    {
+      "wait": "url=/manage"
+    },
+    {
+      "check": "text=營運管理"
+    },
+    {
+      "screenshot": "08-營運管理_manage"
+    }
+  ],
+  "step_results": [
+    {
+      "index": 1,
+      "action": "open",
+      "target": "/",
+      "passed": true,
+      "detail": "ok",
+      "screenshot": "report/step_01_open.png"
+    },
+    {
+      "index": 2,
+      "action": "check",
+      "target": "text=申請案營運主控台",
+      "passed": true,
+      "detail": "visible text: 申請案營運主控台",
+      "screenshot": "report/step_02_check.png"
+    },
+    {
+      "index": 3,
+      "action": "check",
+      "target": "text=申請案收件看板",
+      "passed": true,
+      "detail": "visible text: 申請案收件看板",
+      "screenshot": "report/step_03_check.png"
+    },
+    {
+      "index": 4,
+      "action": "screenshot",
+      "target": "01-申請案營運主控台_申請案列表",
+      "passed": true,
+      "detail": "manual screenshot step",
+      "screenshot": "report/step_04_screenshot.png"
+    },
+    {
+      "index": 5,
+      "action": "click",
+      "target": "text=查看詳情",
+      "passed": true,
+      "detail": "ok",
+      "screenshot": "report/step_05_click.png"
+    },
+    {
+      "index": 6,
+      "action": "wait",
+      "target": "url=/ethics/applications/",
+      "passed": true,
+      "detail": "ok",
+      "screenshot": "report/step_06_wait.png"
+    },
+    {
+      "index": 7,
+      "action": "check",
+      "target": "text=MedAIRA Ethics Demo Application 100",
+      "passed": true,
+      "detail": "visible text: MedAIRA Ethics Demo Application 100",
+      "screenshot": "report/step_07_check.png"
+    },
+    {
+      "index": 8,
+      "action": "check",
+      "target": "text=申請案概況",
+      "passed": true,
+      "detail": "visible text: 申請案概況",
+      "screenshot": "report/step_08_check.png"
+    },
+    {
+      "index": 9,
+      "action": "screenshot",
+      "target": "02-申請案詳情_MedAIRA_Ethics_Demo_Application_100",
+      "passed": true,
+      "detail": "manual screenshot step",
+      "screenshot": "report/step_09_screenshot.png"
+    },
+    {
+      "index": 10,
+      "action": "click",
+      "target": "text=全域角色",
+      "passed": true,
+      "detail": "ok",
+      "screenshot": "report/step_10_click.png"
+    },
+    {
+      "index": 11,
+      "action": "wait",
+      "target": "url=/roles",
+      "passed": true,
+      "detail": "ok",
+      "screenshot": "report/step_11_wait.png"
+    },
+    {
+      "index": 12,
+      "action": "check",
+      "target": "text=全域角色",
+      "passed": true,
+      "detail": "visible text: 全域角色",
+      "screenshot": "report/step_12_check.png"
+    },
+    {
+      "index": 13,
+      "action": "screenshot",
+      "target": "03-全域角色_roles",
+      "passed": true,
+      "detail": "manual screenshot step",
+      "screenshot": "report/step_13_screenshot.png"
+    },
+    {
+      "index": 14,
+      "action": "open",
+      "target": "/ethics/applications",
+      "passed": true,
+      "detail": "ok",
+      "screenshot": "report/step_14_open.png"
+    },
+    {
+      "index": 15,
+      "action": "click",
+      "target": "text=查看詳情",
+      "passed": true,
+      "detail": "ok",
+      "screenshot": "report/step_15_click.png"
+    },
+    {
+      "index": 16,
+      "action": "wait",
+      "target": "url=/ethics/applications/",
+      "passed": true,
+      "detail": "ok",
+      "screenshot": "report/step_16_wait.png"
+    },
+    {
+      "index": 17,
+      "action": "check",
+      "target": "text=MedAIRA Ethics Demo Application 98",
+      "passed": false,
+      "detail": "Locator.wait_for: Timeout 10000ms exceeded.\nCall log:\n  - waiting for get_by_text(\"MedAIRA Ethics Demo Application 98\").first to be visible\n",
+      "screenshot": "report/step_17_check_failed.png"
+    }
+  ],
+  "step_screenshots": [
+    "report/step_01_open.png",
+    "report/step_02_check.png",
+    "report/step_03_check.png",
+    "report/step_04_screenshot.png",
+    "report/step_05_click.png",
+    "report/step_06_wait.png",
+    "report/step_07_check.png",
+    "report/step_08_check.png",
+    "report/step_09_screenshot.png",
+    "report/step_10_click.png",
+    "report/step_11_wait.png",
+    "report/step_12_check.png",
+    "report/step_13_screenshot.png",
+    "report/step_14_open.png",
+    "report/step_15_click.png",
+    "report/step_16_wait.png",
+    "report/step_17_check_failed.png"
+  ],
+  "testplan_path": "/Users/yugojim/ai-dev-agent/testplan.txt",
+  "config_source": "testplan.txt",
+  "font_check_passed": true,
+  "font_check_detail": "報隸\\-繁,Baoli TC,报隶\\-繁"
+}

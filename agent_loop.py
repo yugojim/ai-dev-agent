@@ -74,6 +74,10 @@ DEFAULT_REPO_GIT_URL = normalize_repo_git_url()
 DEFAULT_PLAYWRIGHT_TEST_LOGIN_USERNAME = os.environ.get(
     "PLAYWRIGHT_TEST_LOGIN_USERNAME", "tester"
 ).strip() or "tester"
+DEFAULT_PLAYWRIGHT_TEST_LOGIN_PASSWORD = os.environ.get(
+    "PLAYWRIGHT_TEST_LOGIN_PASSWORD",
+    os.environ.get("TEST_PASSWORD", ""),
+).strip()
 DEFAULT_PLAYWRIGHT_TEST_LOGIN_CHINESE_NAME = os.environ.get(
     "PLAYWRIGHT_TEST_LOGIN_CHINESE_NAME", "測試使用者"
 ).strip() or "測試使用者"
@@ -684,6 +688,10 @@ def run_playwright_capture(workspace_dir: Path, base_url: str) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["PLAYWRIGHT_TEST_LOGIN_USERNAME"] = DEFAULT_PLAYWRIGHT_TEST_LOGIN_USERNAME
+    if DEFAULT_PLAYWRIGHT_TEST_LOGIN_PASSWORD:
+        env["PLAYWRIGHT_TEST_LOGIN_PASSWORD"] = DEFAULT_PLAYWRIGHT_TEST_LOGIN_PASSWORD
+        env["TEST_PASSWORD"] = DEFAULT_PLAYWRIGHT_TEST_LOGIN_PASSWORD
+    env["TEST_USERNAME"] = DEFAULT_PLAYWRIGHT_TEST_LOGIN_USERNAME
     env["PLAYWRIGHT_TEST_LOGIN_CHINESE_NAME"] = DEFAULT_PLAYWRIGHT_TEST_LOGIN_CHINESE_NAME
 
     proc = subprocess.run(

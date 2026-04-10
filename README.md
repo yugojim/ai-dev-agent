@@ -160,6 +160,7 @@ Behavior:
 - If `storage_state` is provided, it tries to reuse that authenticated session first.
 - If `storage_state` is missing or invalid, it will try to log in with `TEST_USERNAME` and `TEST_PASSWORD`.
 - It writes `result.json`, `console.log`, a final `screenshot.png`, and per-step screenshots into the output directory.
+- Supported `testplan` step actions include `open`, `click`, `fill`, `upload`, `wait`, `check`, and `screenshot`.
 
 ## 6. What `agent_loop.py` does
 

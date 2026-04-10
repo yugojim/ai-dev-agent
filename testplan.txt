@@ -5,14 +5,52 @@
 URL: /
 Role: reviewer
 Expected:
-- 說明
+- 申請案營運主控台
+- 倫理審查工作區
 Forbidden:
-- 備註
+- 404
+- Not Found
 Steps:
-1. open=新案申請書
-2. check=附件欄位標題顯示「說明」
-3. open=PI回覆
-4. check=附件欄位標題顯示「說明」
+1. open=/
+2. check=text=申請案營運主控台
+3. check=text=申請案收件看板
+4. screenshot=01-申請案營運主控台_申請案列表
+
+5. click=text=查看詳情
+6. wait=url=/ethics/applications/
+7. check=text=MedAIRA Ethics Demo Application 100
+8. check=text=申請案概況
+9. screenshot=02-申請案詳情_MedAIRA_Ethics_Demo_Application_100
+
+10. click=text=全域角色
+11. wait=url=/roles
+12. check=text=全域角色
+13. screenshot=03-全域角色_roles
+
+14. open=/ethics/applications
+15. click=text=查看詳情
+16. wait=url=/ethics/applications/
+17. check=text=MedAIRA Ethics Demo Application 98
+18. screenshot=04-申請案詳情_MedAIRA_Ethics_Demo_Application_98
+
+19. click=text=平台設定
+20. wait=url=/config
+21. check=text=平台設定
+22. screenshot=05-平台設定_config
+
+23. open=/ethics/applications
+24. check=text=申請案清單
+25. screenshot=06-申請案列表_ethics_applications
+
+26. click=text=生物樣本庫
+27. wait=url=/biobank
+28. check=text=生物樣本庫
+29. screenshot=07-生物樣本庫_biobank
+
+30. click=text=營運管理
+31. wait=url=/manage
+32. check=text=營運管理
+33. screenshot=08-營運管理_manage
 
 Guide:
 # 如何增加測試流程
@@ -29,6 +67,9 @@ Guide:
 # - `fill=css=input[name="keyword"]=>ABC`
 # - `fill=關鍵字|ABC`
 #   `fill` 支援 `selector=>value` 或 `label|value`
+# - `upload=css=input[type="file"]=>./fixtures/demo.pdf`
+# - `upload=附件|./fixtures/demo.pdf`
+#   `upload` 支援 `selector=>file_path` 或 `label|file_path`，相對路徑會以目前專案目錄為基準
 # - `wait=2000`
 #   等待 2000 毫秒
 # - `wait=text=查詢結果`
@@ -46,3 +87,10 @@ Guide:
 # 7. click=role=button|查詢
 # 8. wait=text=查詢結果
 # 9. check=text=A12345
+#
+# 範例：新增附件上傳流程
+# 10. open=/attachments/new
+# 11. upload=css=input[type="file"]=>./fixtures/demo.pdf
+# 12. click=role=button|上傳
+# 13. wait=text=demo.pdf
+# 14. check=text=demo.pdf
